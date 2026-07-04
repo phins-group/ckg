@@ -467,6 +467,36 @@ Check:
 cargo check
 ```
 
+## Release
+
+Release binaries are built by GitHub Actions when a tag matching `v*` is pushed.
+
+Create and push a release tag:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The release workflow builds and uploads:
+
+- `ckg-v0.1.0-x86_64-unknown-linux-gnu.tar.gz`
+- `ckg-v0.1.0-x86_64-apple-darwin.tar.gz`
+- `ckg-v0.1.0-aarch64-apple-darwin.tar.gz`
+- `ckg-v0.1.0-x86_64-pc-windows-msvc.zip`
+
+Build a local release binary:
+
+```bash
+cargo build --release --locked
+```
+
+The binary is written to:
+
+```text
+target/release/ckg
+```
+
 ## Roadmap
 
 - Better TypeScript import/export and symbol resolution.
