@@ -108,16 +108,27 @@ impl Indexer {
         }
 
         if let Some(delta) = git_delta(&repo_root)? {
-            let mut changed_files = sorted_strings(delta.changed);
-            let deleted_files = sorted_strings(delta.deleted);
-            changed_files.retain(|path| !deleted_files.contains(path));
+            let raw_deleted_files = sorted_strings(delta.deleted);
+            let mut raw_changed_files = sorted_strings(delta.changed);
+            raw_changed_files.retain(|path| !raw_deleted_files.contains(path));
+            let mut changed_files = Vec::new();
+            let mut deleted_files = Vec::new();
             let mut new_files = Vec::new();
             let mut modified_files = Vec::new();
-            for path in &changed_files {
-                if self.storage.find_file_by_path(repo_id, path)?.is_some() {
+
+            for path in raw_deleted_files {
+                if self.storage.find_file_by_path(repo_id, &path)?.is_some() {
+                    deleted_files.push(path);
+                }
+            }
+
+            for path in raw_changed_files {
+                if self.storage.find_file_by_path(repo_id, &path)?.is_some() {
                     modified_files.push(path.clone());
-                } else {
+                    changed_files.push(path);
+                } else if scan_path(&repo_root, &path)?.is_some() {
                     new_files.push(path.clone());
+                    changed_files.push(path);
                 }
             }
 
@@ -875,14 +886,12 @@ struct SourceChunk {
     text: String,
 }
 
-fn chunk_source(source: &str, lines_per_chunk: usize, max_chars: usize) -> Vec<SourceChunk> {
+fn chunk_source(source: &str, lines_per_chunk: usize, max_bytes: usize) -> Vec<SourceChunk> {
     let mut chunks = Vec::new();
     let lines: Vec<&str> = source.lines().collect();
     for (idx, group) in lines.chunks(lines_per_chunk).enumerate() {
         let mut text = group.join("\n");
-        if text.len() > max_chars {
-            text.truncate(max_chars);
-        }
+        truncate_to_char_boundary(&mut text, max_bytes);
         let start_line = (idx * lines_per_chunk + 1) as i64;
         let end_line = start_line + group.len() as i64 - 1;
         chunks.push(SourceChunk {
@@ -892,6 +901,18 @@ fn chunk_source(source: &str, lines_per_chunk: usize, max_chars: usize) -> Vec<S
         });
     }
     chunks
+}
+
+fn truncate_to_char_boundary(text: &mut String, max_bytes: usize) {
+    if text.len() <= max_bytes {
+        return;
+    }
+
+    let mut end = max_bytes.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
 }
 
 fn import_candidates(source_path: &str, import_source: &str, aliases: &PathAliases) -> Vec<String> {
@@ -1365,6 +1386,14 @@ mod tests {
     }
 
     #[test]
+    fn chunk_source_truncates_on_utf8_boundary() {
+        let chunks = chunk_source("ab😀cd", 80, 4);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].text, "ab");
+        assert!(chunks[0].text.is_char_boundary(chunks[0].text.len()));
+    }
+
+    #[test]
     fn real_git_revert_after_dirty_index_updates_database() -> Result<()> {
         let dir = tempfile::tempdir()?;
         if !git(dir.path(), &["init"])? {
@@ -1611,6 +1640,29 @@ mod tests {
         assert!(status.modified_files.contains(&"src/a.ts".to_string()));
         assert!(status.new_files.contains(&"src/new.ts".to_string()));
         assert!(status.deleted_files.contains(&"src/delete.ts".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn status_ignores_new_unindexable_paths() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::create_dir_all(dir.path().join("src"))?;
+        fs::create_dir_all(dir.path().join("templates"))?;
+        fs::write(dir.path().join("src/a.ts"), "export const a = 1;\n")?;
+
+        let storage = Storage::open_for_repo(dir.path())?;
+        Indexer::new(storage).index_repo_with_options(dir.path(), IndexOptions { full: true })?;
+
+        fs::write(dir.path().join("src/image.png"), [0_u8, 1, 2, 3])?;
+        std::os::unix::fs::symlink(dir.path().join("missing"), dir.path().join("src/.tool"))?;
+        std::os::unix::fs::symlink("../templates", dir.path().join("public-email"))?;
+
+        let storage = Storage::open_for_repo(dir.path())?;
+        let status = Indexer::new(storage).status_repo(dir.path())?;
+        assert!(!status.needs_index);
+        assert!(status.changed_files.is_empty());
+        assert!(status.new_files.is_empty());
         Ok(())
     }
 

@@ -404,7 +404,7 @@ Fixture:
 | Fixture | Cold index | No-op incremental | 1-file incremental | Status check | Search JSON | task_context 800 | SQLite size |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | 1000 TS files | 1372 ms | 166 ms | 206 ms | 96 ms | 34 ms / 2666 bytes | 88 ms / 3908 bytes | 7.65 MB |
-| 10000 TS files | 7879 ms | 106 ms | 891 ms | 120 ms | 34 ms / 1557 bytes | 542 ms / 3944 bytes | 67.77 MB |
+| 10000 TS files | 7810 ms | 110 ms | 904 ms | 115 ms | 36 ms / 1557 bytes | 562 ms / 3944 bytes | 67.77 MB |
 
 Notes:
 
