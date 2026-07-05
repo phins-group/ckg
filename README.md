@@ -1,60 +1,54 @@
 # ckg
 
-Local-first Code Knowledge Graph and MCP retrieval engine for AI coding agents.
+Stop making AI coding agents read the whole repo.
 
-`ckg` indexes a codebase into a single SQLite database and returns compact,
-graph-aware context for coding agents. It is designed to run on a developer
-machine without Neo4j, Postgres, Qdrant, or any database server.
+[![Release](https://img.shields.io/github/v/release/phins-group/ckg)](https://github.com/phins-group/ckg/releases)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](LICENSE)
+
+Maintained by PHINs Group.
+
+`ckg` is a local-first Code Knowledge Graph for AI coding agents. It indexes
+your repo into SQLite and returns the files, symbols, snippets, tests, and graph
+signals relevant to a task through CLI, HTTP, or MCP stdio.
+
+No database server. No cloud index. No open port required for MCP.
+
+```bash
+cargo install ckg
+ckg index /path/to/repo
+ckg task-context /path/to/repo "Fix bug: user cannot upload avatar" --max-tokens 800 --json
+ckg mcp /path/to/repo --compact
+```
+
+Measured with the included benchmark script on a 10k TypeScript fixture:
+cold index 7810 ms, no-op incremental 110 ms, SQLite DB 67.77 MB.
 
 > Status: early alpha. The graph is useful today, but many analyses are still
 > best-effort and not type-aware.
 
-## Why ckg?
+## Why It Exists
 
-AI coding agents often need more than text search but less than a full IDE
-language server. `ckg` sits in that middle layer:
+Most coding agents can grep, but they still need to know which files define a
+symbol, which routes call a handler, which tests are nearby, and what small
+snippets are worth reading. `ckg` gives the agent that context locally.
 
-- `ripgrep` finds text.
-- LSP finds editor symbols.
-- `ckg` builds compact AST, dependency, call, route, test, and summary context
-  for AI agents.
-
-It is especially useful through MCP stdio, where an agent can ask for task
-context without opening a network port.
-
-## Features
-
-- Local-first storage in `.ckg/ckg.sqlite`.
-- SQLite single-file database.
-- No database server required.
-- MCP stdio server for AI agents.
-- CLI and localhost HTTP API.
-- Incremental indexing by file hash.
-- `.gitignore`-aware scanning through the `ignore` crate.
-- Internal Git snapshot at `.ckg/git` for fast changed/new/deleted file
-  detection.
-- Binary file filtering.
+- Single-file SQLite storage in `.ckg/ckg.sqlite`.
+- Incremental indexing by file hash, respecting `.gitignore`.
 - Tree-sitter parsing for JavaScript, TypeScript, and Rust.
-- SQLite FTS5 full-text search when available, with `LIKE` fallback.
-- Task-focused context packing with an approximate token budget.
-
-Current graph coverage:
-
-- AST/symbol graph: files, directories, functions, methods, classes, types.
-- Dependency graph: relative JS/TS imports, named imports, namespace imports,
-  and basic `tsconfig.json` path aliases.
-- Call graph: in-file calls and basic imported cross-file calls.
-- Product flow graph: simple JS/TS route entrypoints such as
-  `router.post("/avatar", handler)`.
-- Test graph: heuristic test symbols and `TESTS` edges when calls resolve.
-- Semantic summaries: leading comments/doc comments and signature fallback.
+- FTS search over paths, symbols, summaries, and source chunks.
+- AST/symbol, dependency, call, route/product-flow, test, and summary signals.
+- MCP compact mode with bounded output for token-conscious agents.
 
 ## Install
 
-Download a prebuilt binary from
+```bash
+cargo install ckg
+```
+
+Prebuilt binaries are available from
 [GitHub Releases](https://github.com/phins-group/ckg/releases).
 
-Set `VERSION` to the release you want to install, for example `v0.1.5`.
+Set `VERSION` to the release you want, for example `v0.1.5`.
 
 macOS Apple Silicon:
 
@@ -97,107 +91,40 @@ cd ckg
 cargo build --release
 ```
 
-Run with Cargo during development:
+## 60-Second Demo
 
 ```bash
-cargo run -- --help
-```
-
-Use the built binary:
-
-```bash
-./target/release/ckg --help
-```
-
-## Quick Start
-
-Index a repository:
-
-```bash
+# Build a local graph.
 ckg index /path/to/repo
-```
 
-Search indexed code:
-
-```bash
+# Search indexed files and symbols.
 ckg search "upload avatar" --repo-path /path/to/repo --limit 10
-```
 
-Build a task-focused context pack:
-
-```bash
+# Ask for compact task context.
 ckg task-context /path/to/repo "Fix bug: user cannot upload avatar" \
-  --max-tokens 12000 \
-  --hops 2 \
+  --max-tokens 800 \
   --json
-```
 
-Run as an MCP stdio server:
-
-```bash
+# Start MCP stdio mode for local agents.
 ckg mcp /path/to/repo --compact
 ```
 
-Run the localhost HTTP API:
+Typical compact `task-context` output includes relevant files, symbols, read
+hints, suggested tests, graph counts, and a short context pack under the token
+budget.
 
-```bash
-ckg serve /path/to/repo --port 8765
-```
-
-## CLI Commands
-
-Initialize local storage:
+## Commands
 
 ```bash
 ckg init /path/to/repo
-```
-
-Index incrementally:
-
-```bash
 ckg index /path/to/repo
-```
-
-Force a full scan:
-
-```bash
 ckg index /path/to/repo --full
-```
-
-Search:
-
-```bash
 ckg search "AvatarService" --repo-path /path/to/repo --limit 20
-```
-
-Search as JSON:
-
-```bash
 ckg search "AvatarService" --repo-path /path/to/repo --json
-```
-
-Check database health:
-
-```bash
 ckg doctor /path/to/repo
 ckg doctor /path/to/repo --maintenance --json
-```
-
-Task context:
-
-```bash
 ckg task-context /path/to/repo "Fix avatar upload" --max-tokens 800 --json
-```
-
-MCP stdio:
-
-```bash
 ckg mcp /path/to/repo --compact
-```
-
-HTTP server:
-
-```bash
 ckg serve /path/to/repo --port 8765
 ```
 
@@ -386,6 +313,14 @@ Set `FILES=10000` to generate a larger fixture.
 It builds the release binary, generates a temporary TypeScript fixture, runs
 indexing/retrieval commands, and prints a Markdown report.
 
+Current 10k-file sample on the measured machine:
+
+- Cold index: 7810 ms.
+- No-op incremental index: 110 ms.
+- One-file incremental index: 904 ms.
+- MCP status check: 115 ms.
+- SQLite database size: 67.77 MB.
+
 Sample result measured with `scripts/benchmark.sh`:
 
 Environment:
@@ -519,38 +454,6 @@ Check:
 
 ```bash
 cargo check
-```
-
-## Release
-
-Release binaries are built by GitHub Actions when a tag matching `v*` is pushed.
-
-Create and push a release tag:
-
-```bash
-git tag v0.1.5
-git push origin v0.1.5
-```
-
-The release workflow builds and uploads:
-
-- `ckg-v0.1.5-x86_64-unknown-linux-gnu.tar.gz`
-- `ckg-v0.1.5-aarch64-apple-darwin.tar.gz`
-- `ckg-v0.1.5-x86_64-pc-windows-msvc.zip`
-
-macOS Intel users can build from source until an `x86_64-apple-darwin` release
-target is added.
-
-Build a local release binary:
-
-```bash
-cargo build --release --locked
-```
-
-The binary is written to:
-
-```text
-target/release/ckg
 ```
 
 ## Roadmap

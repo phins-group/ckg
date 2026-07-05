@@ -3,7 +3,7 @@
 
 [package]
 name = "ckg"
-version = "0.1.0"
+version = "0.1.5"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Local-first Code Knowledge Graph and MCP retrieval engine for AI coding agents"
@@ -12,6 +12,16 @@ repository = "https://github.com/phins-group/ckg"
 homepage = "https://github.com/phins-group/ckg"
 keywords = ["code-search", "sqlite", "mcp", "tree-sitter", "agents"]
 categories = ["command-line-utilities", "development-tools"]
+include = [
+    "/src",
+    "/scripts/benchmark.sh",
+    "/Cargo.lock",
+    "/Cargo.toml",
+    "/LICENSE",
+    "/README.md",
+    "/MCP.md",
+    "/AGENTS.md",
+]
 
 [dependencies]
 anyhow = "1"
