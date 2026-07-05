@@ -54,12 +54,12 @@ Current graph coverage:
 Download a prebuilt binary from
 [GitHub Releases](https://github.com/phins-group/ckg/releases).
 
-Set `VERSION` to the release you want to install, for example `v0.1.0`.
+Set `VERSION` to the release you want to install, for example `v0.1.4`.
 
 macOS Apple Silicon:
 
 ```bash
-VERSION=v0.1.0
+VERSION=v0.1.4
 curl -L "https://github.com/phins-group/ckg/releases/download/${VERSION}/ckg-${VERSION}-aarch64-apple-darwin.tar.gz" -o ckg.tar.gz
 tar -xzf ckg.tar.gz
 sudo install "ckg-${VERSION}-aarch64-apple-darwin/ckg" /usr/local/bin/ckg
@@ -69,7 +69,7 @@ ckg --help
 Linux x86_64:
 
 ```bash
-VERSION=v0.1.0
+VERSION=v0.1.4
 curl -L "https://github.com/phins-group/ckg/releases/download/${VERSION}/ckg-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" -o ckg.tar.gz
 tar -xzf ckg.tar.gz
 sudo install "ckg-${VERSION}-x86_64-unknown-linux-gnu/ckg" /usr/local/bin/ckg
@@ -79,7 +79,7 @@ ckg --help
 Windows x86_64 PowerShell:
 
 ```powershell
-$Version = "v0.1.0"
+$Version = "v0.1.4"
 $Zip = "ckg-$Version-x86_64-pc-windows-msvc.zip"
 Invoke-WebRequest "https://github.com/phins-group/ckg/releases/download/$Version/$Zip" -OutFile $Zip
 Expand-Archive $Zip -DestinationPath .
@@ -528,15 +528,15 @@ Release binaries are built by GitHub Actions when a tag matching `v*` is pushed.
 Create and push a release tag:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.1.4
+git push origin v0.1.4
 ```
 
 The release workflow builds and uploads:
 
-- `ckg-v0.1.0-x86_64-unknown-linux-gnu.tar.gz`
-- `ckg-v0.1.0-aarch64-apple-darwin.tar.gz`
-- `ckg-v0.1.0-x86_64-pc-windows-msvc.zip`
+- `ckg-v0.1.4-x86_64-unknown-linux-gnu.tar.gz`
+- `ckg-v0.1.4-aarch64-apple-darwin.tar.gz`
+- `ckg-v0.1.4-x86_64-pc-windows-msvc.zip`
 
 macOS Intel users can build from source until an `x86_64-apple-darwin` release
 target is added.
