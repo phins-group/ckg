@@ -83,6 +83,16 @@ pub struct ImportEdgeRecord {
     pub metadata: serde_json::Value,
 }
 
+struct FtsEntry<'a> {
+    kind: &'a str,
+    ref_id: i64,
+    file_id: Option<i64>,
+    node_id: Option<i64>,
+    path: &'a str,
+    name: &'a str,
+    text: &'a str,
+}
+
 impl Storage {
     pub fn open_for_repo(repo_path: &Path) -> Result<Self> {
         let db_dir = repo_path.join(".ckg");
@@ -432,15 +442,15 @@ impl Storage {
             )?;
             stmt.execute(params![file_id, file.hash, file.size, file.modified_at])?;
         }
-        self.upsert_fts(
-            "file",
-            file_id,
-            Some(file_id),
-            None,
-            file.path,
-            file.path,
-            file.language.unwrap_or(""),
-        )?;
+        self.upsert_fts(FtsEntry {
+            kind: "file",
+            ref_id: file_id,
+            file_id: Some(file_id),
+            node_id: None,
+            path: file.path,
+            name: file.path,
+            text: file.language.unwrap_or(""),
+        })?;
         Ok(file_id)
     }
 
@@ -545,15 +555,15 @@ impl Storage {
                 | NodeKind::Doc
                 | NodeKind::Endpoint
         ) {
-            self.upsert_fts(
-                "node",
-                id,
-                node.file_id,
-                Some(id),
-                node.path.unwrap_or(""),
-                node.name,
-                node.summary.unwrap_or(node.qualified_name),
-            )?;
+            self.upsert_fts(FtsEntry {
+                kind: "node",
+                ref_id: id,
+                file_id: node.file_id,
+                node_id: Some(id),
+                path: node.path.unwrap_or(""),
+                name: node.name,
+                text: node.summary.unwrap_or(node.qualified_name),
+            })?;
         }
         Ok(id)
     }
@@ -641,15 +651,15 @@ impl Storage {
         }
         let id = self.conn.last_insert_rowid();
         if let Some(search_text) = chunk.search_text {
-            self.upsert_fts(
-                "chunk",
-                id,
-                Some(chunk.file_id),
-                chunk.node_id,
-                "",
-                chunk.kind,
-                search_text,
-            )?;
+            self.upsert_fts(FtsEntry {
+                kind: "chunk",
+                ref_id: id,
+                file_id: Some(chunk.file_id),
+                node_id: chunk.node_id,
+                path: "",
+                name: chunk.kind,
+                text: search_text,
+            })?;
         }
         Ok(id)
     }
@@ -1155,16 +1165,7 @@ impl Storage {
             .map_err(Into::into)
     }
 
-    fn upsert_fts(
-        &self,
-        kind: &str,
-        ref_id: i64,
-        file_id: Option<i64>,
-        node_id: Option<i64>,
-        path: &str,
-        name: &str,
-        text: &str,
-    ) -> Result<()> {
+    fn upsert_fts(&self, entry: FtsEntry<'_>) -> Result<()> {
         if !self.fts_available()? {
             return Ok(());
         }
@@ -1172,7 +1173,15 @@ impl Storage {
             "INSERT INTO search_fts(kind, ref_id, file_id, node_id, path, name, text)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )?;
-        stmt.execute(params![kind, ref_id, file_id, node_id, path, name, text])?;
+        stmt.execute(params![
+            entry.kind,
+            entry.ref_id,
+            entry.file_id,
+            entry.node_id,
+            entry.path,
+            entry.name,
+            entry.text
+        ])?;
         Ok(())
     }
 
@@ -1249,8 +1258,7 @@ fn row_to_edge(row: &Row<'_>) -> rusqlite::Result<EdgeRecord> {
 }
 
 fn repeat_vars(count: usize) -> String {
-    std::iter::repeat("?")
-        .take(count)
+    std::iter::repeat_n("?", count)
         .collect::<Vec<_>>()
         .join(",")
 }

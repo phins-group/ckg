@@ -4,7 +4,7 @@
 use std::{
     collections::{HashMap, HashSet},
     io::{self, BufRead, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use anyhow::Result;
@@ -69,11 +69,7 @@ pub fn serve_stdio(repo_path: PathBuf, options: McpOptions) -> Result<()> {
     Ok(())
 }
 
-fn handle_request(
-    repo_path: &PathBuf,
-    request: &Value,
-    options: McpOptions,
-) -> Result<Option<Value>> {
+fn handle_request(repo_path: &Path, request: &Value, options: McpOptions) -> Result<Option<Value>> {
     let method = request
         .get("method")
         .and_then(|method| method.as_str())
@@ -130,7 +126,7 @@ fn handle_request(
     }
 }
 
-fn call_tool(repo_path: &PathBuf, name: &str, args: Value, options: McpOptions) -> Result<Value> {
+fn call_tool(repo_path: &Path, name: &str, args: Value, options: McpOptions) -> Result<Value> {
     match canonical_tool_name(name) {
         "ckg_index" => {
             let storage = Storage::open_for_repo(repo_path)?;
@@ -814,7 +810,7 @@ fn tools(options: McpOptions) -> Value {
     Value::Array(tools)
 }
 
-fn resources_list(repo_path: &PathBuf, options: McpOptions) -> Result<Value> {
+fn resources_list(repo_path: &Path, options: McpOptions) -> Result<Value> {
     let storage = Storage::open_for_repo(repo_path)?;
     if !options.compact {
         Indexer::new(storage).index_repo(repo_path)?;
@@ -952,7 +948,7 @@ fn resources_templates_list() -> Value {
     })
 }
 
-fn resources_read(repo_path: &PathBuf, uri: &str, options: McpOptions) -> Result<Value> {
+fn resources_read(repo_path: &Path, uri: &str, options: McpOptions) -> Result<Value> {
     let storage = Storage::open_for_repo(repo_path)?;
     if !options.compact {
         Indexer::new(storage).index_repo(repo_path)?;
@@ -1035,7 +1031,7 @@ fn resources_read(repo_path: &PathBuf, uri: &str, options: McpOptions) -> Result
 }
 
 fn graph_resource(
-    repo_path: &PathBuf,
+    repo_path: &Path,
     name: &str,
     kinds: &[&str],
     options: McpOptions,
@@ -1222,7 +1218,7 @@ fn position_schema(include_direction: bool) -> Value {
     value
 }
 
-fn maybe_auto_index(repo_path: &PathBuf, args: &Value, options: McpOptions) -> Result<()> {
+fn maybe_auto_index(repo_path: &Path, args: &Value, options: McpOptions) -> Result<()> {
     let enabled = args
         .get("auto_index")
         .and_then(|value| value.as_bool())
@@ -1673,7 +1669,7 @@ mod tests {
         Ok(dir)
     }
 
-    fn call(repo_path: &PathBuf, request: Value) -> Result<Value> {
+    fn call(repo_path: &Path, request: Value) -> Result<Value> {
         handle_request(repo_path, &request, McpOptions { compact: true })?
             .ok_or_else(|| anyhow::anyhow!("missing MCP response"))
     }
@@ -1682,7 +1678,7 @@ mod tests {
     fn compact_resource_file_is_paginated_and_budgeted() -> Result<()> {
         let dir = setup_repo()?;
         let response = call(
-            &dir.path().to_path_buf(),
+            dir.path(),
             json!({
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -1703,7 +1699,7 @@ mod tests {
     fn compact_resource_graph_is_brief_and_budgeted() -> Result<()> {
         let dir = setup_repo()?;
         let response = call(
-            &dir.path().to_path_buf(),
+            dir.path(),
             json!({
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -1725,7 +1721,7 @@ mod tests {
     fn compact_task_context_tool_is_budgeted() -> Result<()> {
         let dir = setup_repo()?;
         let response = call(
-            &dir.path().to_path_buf(),
+            dir.path(),
             json!({
                 "jsonrpc": "2.0",
                 "id": 1,
