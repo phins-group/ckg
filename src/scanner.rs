@@ -89,9 +89,17 @@ pub fn scan_path(repo_path: &Path, rel_path: &str) -> Result<Option<ScannedFile>
 }
 
 pub fn hash_entry(entry: ScannedEntry) -> Result<ScannedFile> {
-    let hash = blake3::hash(&fs::read(&entry.abs_path)?)
-        .to_hex()
-        .to_string();
+    let mut file = fs::File::open(&entry.abs_path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let hash = hasher.finalize().to_hex().to_string();
     Ok(ScannedFile {
         abs_path: entry.abs_path,
         rel_path: entry.rel_path,

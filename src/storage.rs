@@ -10,6 +10,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Row};
+use serde::Serialize;
 use serde_json::json;
 
 use crate::model::{EdgeKind, EdgeRecord, FileRecord, NodeKind, NodeRecord, SearchHit, Subgraph};
@@ -17,6 +18,21 @@ use crate::model::{EdgeKind, EdgeRecord, FileRecord, NodeKind, NodeRecord, Searc
 pub struct Storage {
     db_path: PathBuf,
     conn: Connection,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DoctorReport {
+    pub db_path: String,
+    pub quick_check: String,
+    pub integrity_ok: bool,
+    pub indexed_files: usize,
+    pub db_bytes: u64,
+    pub wal_bytes: Option<u64>,
+    pub shm_bytes: Option<u64>,
+    pub maintenance_ran: bool,
+    pub optimize_ran: bool,
+    pub fts_optimize_ran: bool,
+    pub wal_checkpoint_ran: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -52,6 +68,7 @@ pub struct NewChunk<'a> {
     pub node_id: Option<i64>,
     pub kind: &'a str,
     pub text: &'a str,
+    pub search_text: Option<&'a str>,
     pub start_line: i64,
     pub end_line: i64,
     pub summary: Option<&'a str>,
@@ -86,6 +103,7 @@ impl Storage {
         }
         let conn = Connection::open(&db_path)
             .with_context(|| format!("failed to open {}", db_path.display()))?;
+        conn.set_prepared_statement_cache_capacity(256);
         let storage = Self { db_path, conn };
         storage.migrate()?;
         Ok(storage)
@@ -112,6 +130,64 @@ impl Storage {
 
     pub fn is_in_write(&self) -> bool {
         !self.conn.is_autocommit()
+    }
+
+    pub fn doctor_report(&self, repo_id: i64, maintenance: bool) -> Result<DoctorReport> {
+        let mut optimize_ran = false;
+        let mut fts_optimize_ran = false;
+        let mut wal_checkpoint_ran = false;
+
+        if maintenance {
+            self.optimize()?;
+            optimize_ran = true;
+            fts_optimize_ran = self.optimize_fts()?;
+            self.wal_checkpoint_truncate()?;
+            wal_checkpoint_ran = true;
+        }
+
+        let quick_check = self.quick_check()?;
+        Ok(DoctorReport {
+            db_path: self.db_path.display().to_string(),
+            integrity_ok: quick_check == "ok",
+            quick_check,
+            indexed_files: self.list_file_paths(repo_id)?.len(),
+            db_bytes: file_size(&self.db_path).unwrap_or(0),
+            wal_bytes: file_size(self.db_path.with_extension("sqlite-wal")),
+            shm_bytes: file_size(self.db_path.with_extension("sqlite-shm")),
+            maintenance_ran: maintenance,
+            optimize_ran,
+            fts_optimize_ran,
+            wal_checkpoint_ran,
+        })
+    }
+
+    pub fn quick_check(&self) -> Result<String> {
+        self.conn
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .map_err(Into::into)
+    }
+
+    pub fn optimize(&self) -> Result<()> {
+        self.conn.execute_batch("PRAGMA optimize;")?;
+        Ok(())
+    }
+
+    pub fn optimize_fts(&self) -> Result<bool> {
+        if !self.fts_available()? {
+            return Ok(false);
+        }
+        self.conn
+            .execute("INSERT INTO search_fts(search_fts) VALUES('optimize')", [])?;
+        Ok(true)
+    }
+
+    pub fn wal_checkpoint_truncate(&self) -> Result<()> {
+        let _: (i64, i64, i64) =
+            self.conn
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?;
+        Ok(())
     }
 
     pub fn init_repo(&self, repo_path: &Path) -> Result<i64> {
@@ -270,13 +346,11 @@ impl Storage {
     }
 
     pub fn find_file_by_path(&self, repo_id: i64, path: &str) -> Result<Option<FileRecord>> {
-        self.conn
-            .query_row(
-                "SELECT id, repo_id, path, abs_path, extension, language, hash, size, modified_at, is_binary
-                 FROM files WHERE repo_id = ?1 AND path = ?2",
-                params![repo_id, path],
-                row_to_file,
-            )
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, repo_id, path, abs_path, extension, language, hash, size, modified_at, is_binary
+             FROM files WHERE repo_id = ?1 AND path = ?2",
+        )?;
+        stmt.query_row(params![repo_id, path], row_to_file)
             .optional()
             .map_err(Into::into)
     }
@@ -314,19 +388,21 @@ impl Storage {
 
     pub fn upsert_file(&self, repo_id: i64, file: &NewFile<'_>) -> Result<i64> {
         let now = now_secs();
-        self.conn.execute(
-            "INSERT INTO files(repo_id, path, abs_path, extension, language, hash, size, modified_at, is_binary, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-             ON CONFLICT(repo_id, path) DO UPDATE SET
-                abs_path=excluded.abs_path,
-                extension=excluded.extension,
-                language=excluded.language,
-                hash=excluded.hash,
-                size=excluded.size,
-                modified_at=excluded.modified_at,
-                is_binary=excluded.is_binary,
-                updated_at=excluded.updated_at",
-            params![
+        {
+            let mut stmt = self.conn.prepare_cached(
+                "INSERT INTO files(repo_id, path, abs_path, extension, language, hash, size, modified_at, is_binary, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(repo_id, path) DO UPDATE SET
+                    abs_path=excluded.abs_path,
+                    extension=excluded.extension,
+                    language=excluded.language,
+                    hash=excluded.hash,
+                    size=excluded.size,
+                    modified_at=excluded.modified_at,
+                    is_binary=excluded.is_binary,
+                    updated_at=excluded.updated_at",
+            )?;
+            stmt.execute(params![
                 repo_id,
                 file.path,
                 file.abs_path,
@@ -337,22 +413,25 @@ impl Storage {
                 file.modified_at,
                 i64::from(file.is_binary),
                 now
-            ],
-        )?;
-        let file_id: i64 = self.conn.query_row(
-            "SELECT id FROM files WHERE repo_id = ?1 AND path = ?2",
-            params![repo_id, file.path],
-            |row| row.get(0),
-        )?;
-        self.conn.execute(
-            "INSERT INTO file_hashes(file_id, hash, size, modified_at)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(file_id) DO UPDATE SET
-                hash=excluded.hash,
-                size=excluded.size,
-                modified_at=excluded.modified_at",
-            params![file_id, file.hash, file.size, file.modified_at],
-        )?;
+            ])?;
+        }
+        let file_id: i64 = {
+            let mut stmt = self
+                .conn
+                .prepare_cached("SELECT id FROM files WHERE repo_id = ?1 AND path = ?2")?;
+            stmt.query_row(params![repo_id, file.path], |row| row.get(0))?
+        };
+        {
+            let mut stmt = self.conn.prepare_cached(
+                "INSERT INTO file_hashes(file_id, hash, size, modified_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(file_id) DO UPDATE SET
+                    hash=excluded.hash,
+                    size=excluded.size,
+                    modified_at=excluded.modified_at",
+            )?;
+            stmt.execute(params![file_id, file.hash, file.size, file.modified_at])?;
+        }
         self.upsert_fts(
             "file",
             file_id,
@@ -424,16 +503,18 @@ impl Storage {
 
     pub fn upsert_node(&self, node: &NewNode<'_>) -> Result<i64> {
         let metadata = serde_json::to_string(&node.metadata)?;
-        self.conn.execute(
-            "INSERT INTO nodes(repo_id, file_id, kind, name, qualified_name, path, start_line, end_line, summary, metadata)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-             ON CONFLICT DO UPDATE SET
-                file_id=excluded.file_id,
-                name=excluded.name,
-                end_line=excluded.end_line,
-                summary=excluded.summary,
-                metadata=excluded.metadata",
-            params![
+        {
+            let mut stmt = self.conn.prepare_cached(
+                "INSERT INTO nodes(repo_id, file_id, kind, name, qualified_name, path, start_line, end_line, summary, metadata)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT DO UPDATE SET
+                    file_id=excluded.file_id,
+                    name=excluded.name,
+                    end_line=excluded.end_line,
+                    summary=excluded.summary,
+                    metadata=excluded.metadata",
+            )?;
+            stmt.execute(params![
                 node.repo_id,
                 node.file_id,
                 node.kind.as_str(),
@@ -444,8 +525,8 @@ impl Storage {
                 node.end_line,
                 node.summary,
                 metadata
-            ],
-        )?;
+            ])?;
+        }
         let id = self.find_node_id(
             node.repo_id,
             node.kind.as_str(),
@@ -485,18 +566,19 @@ impl Storage {
         path_key: &str,
         start_line_key: i64,
     ) -> Result<i64> {
-        self.conn
-            .query_row(
-                "SELECT id FROM nodes
-                 WHERE repo_id = ?1
-                   AND kind = ?2
-                   AND qualified_name = ?3
-                   AND COALESCE(path, '') = ?4
-                   AND COALESCE(start_line, -1) = ?5",
-                params![repo_id, kind, qualified_name, path_key, start_line_key],
-                |row| row.get(0),
-            )
-            .map_err(Into::into)
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id FROM nodes
+             WHERE repo_id = ?1
+               AND kind = ?2
+               AND qualified_name = ?3
+               AND COALESCE(path, '') = ?4
+               AND COALESCE(start_line, -1) = ?5",
+        )?;
+        stmt.query_row(
+            params![repo_id, kind, qualified_name, path_key, start_line_key],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
     }
 
     pub fn add_edge(
@@ -508,13 +590,19 @@ impl Storage {
         metadata: serde_json::Value,
     ) -> Result<()> {
         let metadata = serde_json::to_string(&metadata)?;
-        self.conn.execute(
+        let mut stmt = self.conn.prepare_cached(
             "INSERT INTO edges(repo_id, source_id, target_id, kind, metadata)
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(repo_id, source_id, target_id, kind)
              DO UPDATE SET metadata=excluded.metadata",
-            params![repo_id, source_id, target_id, kind.as_str(), metadata],
         )?;
+        stmt.execute(params![
+            repo_id,
+            source_id,
+            target_id,
+            kind.as_str(),
+            metadata
+        ])?;
         Ok(())
     }
 
@@ -533,31 +621,36 @@ impl Storage {
 
     pub fn insert_chunk(&self, chunk: &NewChunk<'_>) -> Result<i64> {
         let metadata = serde_json::to_string(&chunk.metadata)?;
-        self.conn.execute(
-            "INSERT INTO chunks(repo_id, file_id, node_id, kind, text, start_line, end_line, summary, metadata)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
+        let stored_text = compact_chunk_text(chunk.text);
+        {
+            let mut stmt = self.conn.prepare_cached(
+                "INSERT INTO chunks(repo_id, file_id, node_id, kind, text, start_line, end_line, summary, metadata)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )?;
+            stmt.execute(params![
                 chunk.repo_id,
                 chunk.file_id,
                 chunk.node_id,
                 chunk.kind,
-                chunk.text,
+                stored_text,
                 chunk.start_line,
                 chunk.end_line,
                 chunk.summary,
                 metadata
-            ],
-        )?;
+            ])?;
+        }
         let id = self.conn.last_insert_rowid();
-        self.upsert_fts(
-            "chunk",
-            id,
-            Some(chunk.file_id),
-            chunk.node_id,
-            "",
-            chunk.kind,
-            chunk.text,
-        )?;
+        if let Some(search_text) = chunk.search_text {
+            self.upsert_fts(
+                "chunk",
+                id,
+                Some(chunk.file_id),
+                chunk.node_id,
+                "",
+                chunk.kind,
+                search_text,
+            )?;
+        }
         Ok(id)
     }
 
@@ -1022,7 +1115,8 @@ impl Storage {
     ) -> Result<Vec<(i64, i64, String)>> {
         let mut stmt = self.conn.prepare(
             "SELECT start_line, end_line, text FROM chunks
-             WHERE file_id = ?1 ORDER BY start_line LIMIT ?2",
+             WHERE file_id = ?1 AND kind = 'file'
+             ORDER BY start_line LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![file_id, limit as i64], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
@@ -1074,30 +1168,30 @@ impl Storage {
         if !self.fts_available()? {
             return Ok(());
         }
-        self.conn.execute(
+        let mut stmt = self.conn.prepare_cached(
             "INSERT INTO search_fts(kind, ref_id, file_id, node_id, path, name, text)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![kind, ref_id, file_id, node_id, path, name, text],
         )?;
+        stmt.execute(params![kind, ref_id, file_id, node_id, path, name, text])?;
         Ok(())
     }
 
     fn delete_fts(&self, kind: &str, ref_id: i64) -> Result<()> {
         if self.fts_available()? {
-            self.conn.execute(
-                "DELETE FROM search_fts WHERE kind = ?1 AND ref_id = ?2",
-                params![kind, ref_id],
-            )?;
+            let mut stmt = self
+                .conn
+                .prepare_cached("DELETE FROM search_fts WHERE kind = ?1 AND ref_id = ?2")?;
+            stmt.execute(params![kind, ref_id])?;
         }
         Ok(())
     }
 
     fn delete_fts_by_file(&self, kind: &str, file_id: i64) -> Result<()> {
         if self.fts_available()? {
-            self.conn.execute(
-                "DELETE FROM search_fts WHERE kind = ?1 AND file_id = ?2",
-                params![kind, file_id],
-            )?;
+            let mut stmt = self
+                .conn
+                .prepare_cached("DELETE FROM search_fts WHERE kind = ?1 AND file_id = ?2")?;
+            stmt.execute(params![kind, file_id])?;
         }
         Ok(())
     }
@@ -1188,6 +1282,27 @@ fn canonical_or_absolute(path: &Path) -> Result<PathBuf> {
     Ok(std::env::current_dir()?.join(path))
 }
 
+fn file_size(path: impl AsRef<Path>) -> Option<u64> {
+    fs::metadata(path).ok().map(|metadata| metadata.len())
+}
+
+fn compact_chunk_text(text: &str) -> String {
+    const MAX_BYTES: usize = 1200;
+    const TRUNCATED_SUFFIX: &str =
+        "\n... [truncated; source is read from filesystem by line range]";
+    if text.len() <= MAX_BYTES + TRUNCATED_SUFFIX.len() {
+        return text.to_string();
+    }
+
+    let mut end = MAX_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut preview = text[..end].trim_end().to_string();
+    preview.push_str(TRUNCATED_SUFFIX);
+    preview
+}
+
 fn now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1227,6 +1342,20 @@ mod tests {
         )?;
         let hits = storage.search("avatar", 5)?;
         assert!(!hits.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_report_runs_quick_check_and_maintenance() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let storage = Storage::open_path(dir.path().join("ckg.sqlite"))?;
+        let repo_id = storage.init_repo(dir.path())?;
+        let report = storage.doctor_report(repo_id, true)?;
+        assert!(report.integrity_ok);
+        assert_eq!(report.quick_check, "ok");
+        assert!(report.maintenance_ran);
+        assert!(report.optimize_ran);
+        assert!(report.wal_checkpoint_ran);
         Ok(())
     }
 }

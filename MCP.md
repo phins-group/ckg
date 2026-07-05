@@ -29,15 +29,25 @@ The server speaks JSON-RPC over stdin/stdout. Tool responses are returned as MCP
 
 For a bugfix or feature task:
 
-1. Call `task_context` with the task text. Retrieval tools auto-index by default.
-2. Optionally call `index` explicitly for a known full refresh.
-3. Use specific graph tools when deeper reasoning is needed:
+1. Call `status`.
+2. If `needs_index` is true, call `index`, or pass `"auto_index": true` to the
+   next retrieval tool.
+3. Call `task_context` with the task text. In `--compact` mode retrieval tools
+   default to `"auto_index": false`.
+4. Use specific graph tools when deeper reasoning is needed:
    - `dependency_graph` for imports/module relationships.
    - `call_graph` for caller/callee relationships.
    - `product_flow_graph` for endpoint/handler flow.
    - `test_graph` for related tests.
    - `semantic_summaries` for doc-comment/signature summaries.
-4. Use `read` only for targeted file reads.
+5. Use `read` only for targeted file reads.
+
+In `--compact` mode, CKG returns cost-safe defaults: retrieval does not
+auto-index unless requested, `read` defaults to 120 lines, `grep` defaults to 20
+matches, graph tools default to brief summaries with limit 20, and MCP tool
+responses are capped to about 12 KB unless `max_bytes` is provided.
+MCP resources follow the same compact policy: they do not auto-index, file
+resources are paginated, and graph resources return brief JSON summaries.
 
 ## Tool Mapping
 
@@ -119,14 +129,14 @@ Common capability mapping:
 
 Recommended MCP client usage:
 
-1. Call `ckg_status`.
-2. If `needs_index` is `true`, call `ckg_index`, or call the next retrieval tool
+1. Call `status`.
+2. If `needs_index` is `true`, call `index`, or call the next retrieval tool
    with `auto_index: true`.
-3. Call `ckg_task_context` with the user task.
-4. Use `ckg_search`, `ckg_grep`, or `ckg_glob` for follow-up discovery.
-5. Use graph-specific tools when needed: `ckg_call_graph`, `ckg_dependency_graph`,
-   `ckg_product_flow_graph`, `ckg_test_graph`.
-6. Use `ckg_read` for targeted line-range file reads after graph/search narrows the path.
+3. Call `task_context` with the user task.
+4. Use `search`, `grep`, or `glob` for follow-up discovery.
+5. Use graph-specific tools when needed: `call_graph`, `dependency_graph`,
+   `product_flow_graph`, `test_graph`.
+6. Use `read` for targeted line-range file reads after graph/search narrows the path.
 7. Use MCP resources for attachable context when useful:
    `list_mcp_resources`, `list_mcp_resource_templates`, `read_mcp_resource`.
 
@@ -227,9 +237,10 @@ Input:
 ```json
 {
   "task": "Fix bug: user cannot upload avatar",
-  "max_tokens": 12000,
+  "max_tokens": 1000,
   "hops": 2,
-  "response_mode": "brief"
+  "response_mode": "brief",
+  "auto_index": false
 }
 ```
 
@@ -240,8 +251,9 @@ usable context pack as the primary payload, and aggressively limits
 `subgraph.edges`. In `--compact` MCP mode, use graph tools such as
 `ast_graph`, `dependency_graph`, or `call_graph` when a full raw graph is needed.
 For MCP, `response_mode` defaults to `brief` and returns a small shape: `query`,
-`context`, `files`, `symbols`, `tests`, and a graph count plus sample edges. Use
-`response_mode: "normal"` only when raw task-context fields are needed.
+`context`, `files`, `symbols`, `read_hints`, `tests`, and a graph count plus
+sample edges. Use `response_mode: "normal"` only when raw task-context fields
+are needed.
 
 Output:
 
@@ -250,7 +262,8 @@ Output:
   "query": "Fix bug: user cannot upload avatar",
   "context": "## File: ...",
   "files": ["src/avatar.ts"],
-  "symbols": [{ "name": "uploadAvatar", "path": "src/avatar.ts" }],
+  "symbols": [{ "name": "uploadAvatar", "path": "src/avatar.ts", "line": 42, "node_id": 123 }],
+  "read_hints": [{ "path": "src/avatar.ts", "offset": 22, "limit": 80 }],
   "tests": ["src/avatar.test.ts"],
   "graph": {
     "nodes": 3,
@@ -315,8 +328,10 @@ Input:
 Prefixed tool name when server name is `ckg`: `ckg_read`.
 
 If the file is inside the repo but not indexed yet, `read` falls back to a safe
-repo-local filesystem read. Most retrieval tools accept `"auto_index": false`;
-the default is `true`.
+repo-local filesystem read. In `--compact` mode, omitted `limit` defaults to 120
+lines and the response includes `truncated` plus `next_offset` for pagination.
+Most retrieval tools accept `"auto_index": false`;
+the default is `false` in `--compact` mode and `true` in normal mode.
 
 ### LSP-like tools
 
@@ -604,8 +619,9 @@ Call task context:
     "name": "ckg_task_context",
     "arguments": {
       "task": "Fix avatar upload",
-      "max_tokens": 12000,
-      "hops": 2
+      "max_tokens": 1000,
+      "hops": 2,
+      "auto_index": false
     }
   }
 }

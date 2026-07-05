@@ -51,10 +51,48 @@ Current graph coverage:
 
 ## Install
 
-From source:
+Download a prebuilt binary from
+[GitHub Releases](https://github.com/phins-group/ckg/releases).
+
+Set `VERSION` to the release you want to install, for example `v0.1.0`.
+
+macOS Apple Silicon:
 
 ```bash
-git clone https://github.com/phinsgroup/ckg.git
+VERSION=v0.1.0
+curl -L "https://github.com/phins-group/ckg/releases/download/${VERSION}/ckg-${VERSION}-aarch64-apple-darwin.tar.gz" -o ckg.tar.gz
+tar -xzf ckg.tar.gz
+sudo install "ckg-${VERSION}-aarch64-apple-darwin/ckg" /usr/local/bin/ckg
+ckg --help
+```
+
+Linux x86_64:
+
+```bash
+VERSION=v0.1.0
+curl -L "https://github.com/phins-group/ckg/releases/download/${VERSION}/ckg-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" -o ckg.tar.gz
+tar -xzf ckg.tar.gz
+sudo install "ckg-${VERSION}-x86_64-unknown-linux-gnu/ckg" /usr/local/bin/ckg
+ckg --help
+```
+
+Windows x86_64 PowerShell:
+
+```powershell
+$Version = "v0.1.0"
+$Zip = "ckg-$Version-x86_64-pc-windows-msvc.zip"
+Invoke-WebRequest "https://github.com/phins-group/ckg/releases/download/$Version/$Zip" -OutFile $Zip
+Expand-Archive $Zip -DestinationPath .
+.\ckg-$Version-x86_64-pc-windows-msvc\ckg.exe --help
+```
+
+Add the extracted directory to `PATH`, or move `ckg.exe` to a directory already
+on `PATH`.
+
+Build from source:
+
+```bash
+git clone https://github.com/phins-group/ckg.git
 cd ckg
 cargo build --release
 ```
@@ -138,6 +176,13 @@ Search as JSON:
 ckg search "AvatarService" --repo-path /path/to/repo --json
 ```
 
+Check database health:
+
+```bash
+ckg doctor /path/to/repo
+ckg doctor /path/to/repo --maintenance --json
+```
+
 Task context:
 
 ```bash
@@ -176,6 +221,9 @@ Recommended MCP config:
 Use `--compact` for agent-facing configs. It exposes short alias tools only.
 Some MCP clients prefix tool names with the server name. If the server is named
 `ckg`, the alias `task_context` may appear to the model as `ckg_task_context`.
+In compact mode, retrieval tools default to `auto_index: false`, graph tools
+default to brief summaries, `read` defaults to 120 lines, and responses are
+bounded by a 12 KB server-side budget unless `max_bytes` is provided.
 
 Main MCP tools:
 
@@ -210,10 +258,10 @@ Main MCP tools:
 
 For an AI coding agent:
 
-1. Call `ckg_status`.
-2. If `needs_index` is `true`, call `ckg_index`, or call the next retrieval
-   tool with `auto_index: true`.
-3. Call `ckg_task_context`:
+1. Call `status`.
+2. If `needs_index` is `true`, call `index`, or call the next retrieval tool
+   with `auto_index: true`.
+3. Call `task_context`:
 
 ```json
 {
@@ -224,8 +272,7 @@ For an AI coding agent:
 }
 ```
 
-4. Use `ckg_read`, `ckg_grep`, `ckg_search`, or `ckg_definition_at` for
-   follow-up details.
+4. Use `read`, `grep`, `search`, or `definition_at` for follow-up details.
 5. Use graph tools only when the agent needs raw graph data.
 
 `task_context` defaults to `response_mode: "brief"` for MCP. It returns:
@@ -235,7 +282,8 @@ For an AI coding agent:
   "query": "Fix MCP integration",
   "context": "## File: ...",
   "files": ["src/avatar.ts"],
-  "symbols": [{ "name": "uploadAvatar", "path": "src/avatar.ts" }],
+  "symbols": [{ "name": "uploadAvatar", "path": "src/avatar.ts", "line": 42, "node_id": 123 }],
+  "read_hints": [{ "path": "src/avatar.ts", "offset": 22, "limit": 80 }],
   "tests": ["src/avatar.test.ts"],
   "graph": {
     "nodes": 3,
@@ -321,8 +369,9 @@ On later runs, `ckg` tries to avoid full re-indexing:
 - Unchanged files are skipped.
 - Deleted files are removed from the SQLite index.
 
-Retrieval tools in MCP default to `auto_index: true`. Pass `auto_index: false`
-when the caller intentionally accepts stale index reads for speed.
+Retrieval tools in normal MCP mode default to `auto_index: true`. In compact
+mode they default to `auto_index: false`; call `status` first, then `index` only
+when needed.
 
 ## Benchmark
 
@@ -355,7 +404,7 @@ Fixture:
 | Fixture | Cold index | No-op incremental | 1-file incremental | Status check | Search JSON | task_context 800 | SQLite size |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | 1000 TS files | 1372 ms | 166 ms | 206 ms | 96 ms | 34 ms / 2666 bytes | 88 ms / 3908 bytes | 7.65 MB |
-| 10000 TS files | 10470 ms | 815 ms | 1020 ms | 114 ms | 36 ms / 2686 bytes | 583 ms / 3982 bytes | 76.67 MB |
+| 10000 TS files | 7879 ms | 106 ms | 891 ms | 120 ms | 34 ms / 1557 bytes | 542 ms / 3944 bytes | 67.77 MB |
 
 Notes:
 
@@ -387,6 +436,11 @@ Main SQLite tables:
 - `edges`
 - `chunks`
 - `search_fts` when FTS5 is available
+
+Chunk rows store compact previews and line ranges. Full snippets are read from
+the local filesystem when context is packed. FTS still indexes file chunks so
+search can match source text without storing full source twice in ordinary chunk
+rows.
 
 Node kinds:
 
@@ -481,9 +535,11 @@ git push origin v0.1.0
 The release workflow builds and uploads:
 
 - `ckg-v0.1.0-x86_64-unknown-linux-gnu.tar.gz`
-- `ckg-v0.1.0-x86_64-apple-darwin.tar.gz`
 - `ckg-v0.1.0-aarch64-apple-darwin.tar.gz`
 - `ckg-v0.1.0-x86_64-pc-windows-msvc.zip`
+
+macOS Intel users can build from source until an `x86_64-apple-darwin` release
+target is added.
 
 Build a local release binary:
 

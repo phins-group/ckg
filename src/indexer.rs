@@ -201,6 +201,8 @@ impl Indexer {
         let mut indexed = 0;
         let mut skipped_unchanged = 0;
         let mut deleted = 0;
+        let mut dir_node_cache = HashMap::new();
+        let mut import_node_cache = HashMap::new();
         let existing_files = self.storage.list_file_paths(repo_id)?;
         let internal_git_existed = internal_git_dir(&repo_root).join("config").exists();
         let internal_git_ready = ensure_internal_git(&repo_root).unwrap_or(false);
@@ -215,7 +217,13 @@ impl Indexer {
             let result = (|| -> Result<usize> {
                 for scanned in &files {
                     seen_paths.insert(scanned.rel_path.clone());
-                    if self.index_scanned_file(repo_id, repo_node_id, scanned)? {
+                    if self.index_scanned_file(
+                        repo_id,
+                        repo_node_id,
+                        scanned,
+                        &mut dir_node_cache,
+                        &mut import_node_cache,
+                    )? {
                         indexed += 1;
                     } else {
                         skipped_unchanged += 1;
@@ -239,11 +247,7 @@ impl Indexer {
             files.len()
         } else if let Some(delta) = git_delta(&repo_root)? {
             let mut indexed_or_seen_paths = HashSet::new();
-            for path in &delta.deleted {
-                if self.storage.delete_file_by_path(repo_id, path)? {
-                    deleted += 1;
-                }
-            }
+            let mut scanned_files = Vec::new();
 
             for path in &delta.changed {
                 if delta.deleted.contains(path) {
@@ -259,10 +263,37 @@ impl Indexer {
                     continue;
                 };
                 indexed_or_seen_paths.insert(path.clone());
-                if self.index_scanned_file(repo_id, repo_node_id, &scanned)? {
-                    indexed += 1;
-                } else {
-                    skipped_unchanged += 1;
+                scanned_files.push(scanned);
+            }
+
+            self.storage.begin_write()?;
+            let result = (|| -> Result<()> {
+                for path in &delta.deleted {
+                    if self.storage.delete_file_by_path(repo_id, path)? {
+                        deleted += 1;
+                    }
+                }
+
+                for scanned in &scanned_files {
+                    if self.index_scanned_file(
+                        repo_id,
+                        repo_node_id,
+                        scanned,
+                        &mut dir_node_cache,
+                        &mut import_node_cache,
+                    )? {
+                        indexed += 1;
+                    } else {
+                        skipped_unchanged += 1;
+                    }
+                }
+                Ok(())
+            })();
+            match result {
+                Ok(()) => self.storage.commit_write()?,
+                Err(error) => {
+                    let _ = self.storage.rollback_write();
+                    return Err(error);
                 }
             }
             if delta.internal {
@@ -286,7 +317,13 @@ impl Indexer {
                         }
                     }
                     let scanned = hash_entry(entry)?;
-                    if self.index_scanned_file(repo_id, repo_node_id, &scanned)? {
+                    if self.index_scanned_file(
+                        repo_id,
+                        repo_node_id,
+                        &scanned,
+                        &mut dir_node_cache,
+                        &mut import_node_cache,
+                    )? {
                         indexed += 1;
                     } else {
                         skipped_unchanged += 1;
@@ -310,8 +347,10 @@ impl Indexer {
             seen_paths.len()
         };
 
-        let aliases = PathAliases::load(&repo_root);
-        self.resolve_local_imports(repo_id, &aliases)?;
+        if indexed > 0 || deleted > 0 {
+            let aliases = PathAliases::load(&repo_root);
+            self.resolve_local_imports(repo_id, &aliases)?;
+        }
 
         Ok(IndexReport {
             repo_id,
@@ -328,17 +367,17 @@ impl Indexer {
         repo_id: i64,
         repo_node_id: i64,
         scanned: &ScannedFile,
+        dir_node_cache: &mut HashMap<String, i64>,
+        import_node_cache: &mut HashMap<String, i64>,
     ) -> Result<bool> {
-        if let Some(existing) = self.storage.find_file_by_path(repo_id, &scanned.rel_path)? {
+        let existing = self.storage.find_file_by_path(repo_id, &scanned.rel_path)?;
+        if let Some(existing) = &existing {
             if existing.hash == scanned.hash {
                 return Ok(false);
             }
         }
 
-        let existing_file_id = self
-            .storage
-            .find_file_by_path(repo_id, &scanned.rel_path)?
-            .map(|file| file.id);
+        let existing_file_id = existing.map(|file| file.id);
 
         let source = fs::read_to_string(&scanned.abs_path)
             .with_context(|| format!("failed to read {}", scanned.abs_path.display()))?;
@@ -365,8 +404,12 @@ impl Indexer {
             };
             let file_id = self.storage.upsert_file(repo_id, &new_file)?;
 
-            let parent_node_id =
-                self.ensure_directory_chain(repo_id, repo_node_id, &scanned.rel_path)?;
+            let parent_node_id = self.ensure_directory_chain(
+                repo_id,
+                repo_node_id,
+                &scanned.rel_path,
+                dir_node_cache,
+            )?;
             let file_node_id = self.ensure_file_node(repo_id, file_id, &scanned.rel_path)?;
             self.storage.add_edge(
                 repo_id,
@@ -421,6 +464,7 @@ impl Indexer {
                     node_id: Some(node_id),
                     kind: symbol.kind.as_str(),
                     text: &symbol.snippet,
+                    search_text: None,
                     start_line: symbol.start_line,
                     end_line: symbol.end_line,
                     summary: Some(symbol.doc_summary.as_deref().unwrap_or(&symbol.signature)),
@@ -515,18 +559,26 @@ impl Indexer {
             }
 
             for import in &parsed.imports {
-                let import_node_id = self.storage.upsert_node(&NewNode {
-                    repo_id,
-                    file_id: None,
-                    kind: NodeKind::Symbol,
-                    name: &import.source,
-                    qualified_name: &format!("import:{}", import.source),
-                    path: None,
-                    start_line: None,
-                    end_line: None,
-                    summary: Some("Imported dependency"),
-                    metadata: json!({ "external": true, "line": import.line, "bindings": import.bindings }),
-                })?;
+                let import_node_id = if let Some(import_node_id) =
+                    import_node_cache.get(&import.source)
+                {
+                    *import_node_id
+                } else {
+                    let import_node_id = self.storage.upsert_node(&NewNode {
+                        repo_id,
+                        file_id: None,
+                        kind: NodeKind::Symbol,
+                        name: &import.source,
+                        qualified_name: &format!("import:{}", import.source),
+                        path: None,
+                        start_line: None,
+                        end_line: None,
+                        summary: Some("Imported dependency"),
+                        metadata: json!({ "external": true, "line": import.line, "bindings": import.bindings }),
+                    })?;
+                    import_node_cache.insert(import.source.clone(), import_node_id);
+                    import_node_id
+                };
                 self.storage.add_edge(
                     repo_id,
                     file_node_id,
@@ -543,6 +595,7 @@ impl Indexer {
                     node_id: Some(file_node_id),
                     kind: "file",
                     text: &chunk.text,
+                    search_text: Some(&chunk.text),
                     start_line: chunk.start_line,
                     end_line: chunk.end_line,
                     summary: Some(&format!(
@@ -746,6 +799,7 @@ impl Indexer {
         repo_id: i64,
         repo_node_id: i64,
         rel_file_path: &str,
+        dir_node_cache: &mut HashMap<String, i64>,
     ) -> Result<i64> {
         let parent = Path::new(rel_file_path)
             .parent()
@@ -763,6 +817,10 @@ impl Indexer {
             } else {
                 current_path.push('/');
                 current_path.push_str(&name);
+            }
+            if let Some(dir_node_id) = dir_node_cache.get(&current_path) {
+                current_parent_id = *dir_node_id;
+                continue;
             }
             let dir_node_id = self.storage.upsert_node(&NewNode {
                 repo_id,
@@ -783,6 +841,7 @@ impl Indexer {
                 EdgeKind::Contains,
                 json!({}),
             )?;
+            dir_node_cache.insert(current_path.clone(), dir_node_id);
             current_parent_id = dir_node_id;
         }
 

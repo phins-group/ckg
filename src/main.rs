@@ -55,6 +55,13 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    Doctor {
+        repo_path: PathBuf,
+        #[arg(long)]
+        maintenance: bool,
+        #[arg(long)]
+        json: bool,
+    },
     Mcp {
         repo_path: PathBuf,
         #[arg(long)]
@@ -134,11 +141,35 @@ async fn main() -> Result<()> {
         } => {
             let storage = Storage::open_for_repo(&repo_path)?;
             let engine = RetrievalEngine::new(storage);
-            let context = engine.task_context(&task, max_tokens, hops)?;
+            let context =
+                engine.task_context_for_repo(Some(&repo_path), &task, max_tokens, hops, true)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&context)?);
             } else {
                 println!("{}", context.context_pack);
+            }
+        }
+        Commands::Doctor {
+            repo_path,
+            maintenance,
+            json,
+        } => {
+            let storage = Storage::open_for_repo(&repo_path)?;
+            let repo_id = storage.init_repo(&repo_path)?;
+            let report = storage.doctor_report(repo_id, maintenance)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("db={}", report.db_path);
+                println!("quick_check={}", report.quick_check);
+                println!("indexed_files={}", report.indexed_files);
+                println!("db_bytes={}", report.db_bytes);
+                println!("wal_bytes={}", report.wal_bytes.unwrap_or(0));
+                println!("shm_bytes={}", report.shm_bytes.unwrap_or(0));
+                println!("maintenance_ran={}", report.maintenance_ran);
+                println!("optimize_ran={}", report.optimize_ran);
+                println!("fts_optimize_ran={}", report.fts_optimize_ran);
+                println!("wal_checkpoint_ran={}", report.wal_checkpoint_ran);
             }
         }
         Commands::Mcp { repo_path, compact } => {

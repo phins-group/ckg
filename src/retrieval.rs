@@ -36,15 +36,6 @@ impl RetrievalEngine {
         self.storage.neighborhood(node_id, hops)
     }
 
-    pub fn task_context(
-        &self,
-        task: &str,
-        max_tokens: usize,
-        hops: usize,
-    ) -> Result<TaskContextResponse> {
-        self.task_context_for_repo(None, task, max_tokens, hops, true)
-    }
-
     pub fn task_context_for_repo(
         &self,
         repo_path: Option<&Path>,
@@ -625,10 +616,16 @@ impl RetrievalEngine {
                 }
             }
 
+            let source = fs::read_to_string(&file.abs_path).ok();
             for (start, end, text) in self.storage.read_chunks_for_file(*file_id, 3)? {
+                let snippet = source
+                    .as_deref()
+                    .map(|source| source_line_range(source, start, end))
+                    .filter(|snippet| !snippet.trim().is_empty())
+                    .unwrap_or(text);
                 let chunk = format!(
                     "\nSnippet {}:{}-{}\n```\n{}\n```\n",
-                    file.path, start, end, text
+                    file.path, start, end, snippet
                 );
                 if !push_budgeted(&mut out, &chunk, char_budget) {
                     return Ok(out);
@@ -645,6 +642,17 @@ fn push_budgeted(out: &mut String, next: &str, char_budget: usize) -> bool {
     }
     out.push_str(next);
     true
+}
+
+fn source_line_range(source: &str, start_line: i64, end_line: i64) -> String {
+    let start = start_line.max(1) as usize;
+    let end = end_line.max(start_line).max(1) as usize;
+    source
+        .lines()
+        .skip(start.saturating_sub(1))
+        .take(end.saturating_sub(start).saturating_add(1))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn budget_task_context_response(

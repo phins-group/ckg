@@ -115,10 +115,12 @@ async fn task_context(
     let storage = Storage::open_for_repo(&state.repo_path).map_err(api_error)?;
     let engine = RetrievalEngine::new(storage);
     let response = engine
-        .task_context(
+        .task_context_for_repo(
+            Some(&state.repo_path),
             &request.task,
             request.max_tokens.unwrap_or(12_000),
             request.hops.unwrap_or(2),
+            true,
         )
         .map_err(api_error)?;
     Ok(Json(response))

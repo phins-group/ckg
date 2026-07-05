@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::{self, BufRead, Write},
     path::PathBuf,
 };
@@ -18,6 +18,8 @@ use crate::{
 pub struct McpOptions {
     pub compact: bool,
 }
+
+const MCP_INSTRUCTIONS: &str = "Use CKG cost-consciously: call status first; index only when status.needs_index is true; prefer task_context with response_mode=brief; read files with offset/limit; use graph tools only when raw graph data is explicitly needed; in compact mode retrieval tools default to auto_index=false and bounded output.";
 
 pub fn serve_stdio(repo_path: PathBuf, options: McpOptions) -> Result<()> {
     let stdin = io::stdin();
@@ -82,7 +84,8 @@ fn handle_request(
         "initialize" => Ok(Some(json!({
             "protocolVersion": "2024-11-05",
             "capabilities": { "tools": {}, "resources": {} },
-            "serverInfo": { "name": "ckg", "version": env!("CARGO_PKG_VERSION") }
+            "serverInfo": { "name": "ckg", "version": env!("CARGO_PKG_VERSION") },
+            "instructions": MCP_INSTRUCTIONS
         }))),
         "tools/list" => Ok(Some(json!({ "tools": tools(options) }))),
         "tools/call" => {
@@ -94,7 +97,8 @@ fn handle_request(
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            let value = call_tool(repo_path, name, args)?;
+            let value = call_tool(repo_path, name, args.clone(), options)?;
+            let value = budget_tool_value(value, &args, options)?;
             let text = if options.compact {
                 serde_json::to_string(&value)?
             } else {
@@ -107,20 +111,26 @@ fn handle_request(
                 }]
             })))
         }
-        "resources/list" => Ok(Some(resources_list(repo_path)?)),
+        "resources/list" => {
+            let value = resources_list(repo_path, options)?;
+            let value = budget_tool_value(value, &json!({}), options)?;
+            Ok(Some(value))
+        }
         "resources/templates/list" => Ok(Some(resources_templates_list())),
         "resources/read" => {
             let uri = params
                 .get("uri")
                 .and_then(|uri| uri.as_str())
                 .unwrap_or_default();
-            Ok(Some(resources_read(repo_path, uri)?))
+            let value = resources_read(repo_path, uri, options)?;
+            let value = budget_tool_value(value, &json!({}), options)?;
+            Ok(Some(value))
         }
         _ => Ok(Some(json!({}))),
     }
 }
 
-fn call_tool(repo_path: &PathBuf, name: &str, args: Value) -> Result<Value> {
+fn call_tool(repo_path: &PathBuf, name: &str, args: Value, options: McpOptions) -> Result<Value> {
     match canonical_tool_name(name) {
         "ckg_index" => {
             let storage = Storage::open_for_repo(repo_path)?;
@@ -137,10 +147,15 @@ fn call_tool(repo_path: &PathBuf, name: &str, args: Value) -> Result<Value> {
         "ckg_status" => {
             let storage = Storage::open_for_repo(repo_path)?;
             let report = Indexer::new(storage).status_repo(repo_path)?;
-            Ok(serde_json::to_value(report)?)
+            let value = serde_json::to_value(report)?;
+            if options.compact && !arg_bool(&args, "include_files", false) {
+                Ok(brief_status(value, 20))
+            } else {
+                Ok(value)
+            }
         }
         "ckg_search" => {
-            maybe_auto_index(repo_path, &args)?;
+            maybe_auto_index(repo_path, &args, options)?;
             let query = required_str(&args, "query")?;
             let limit = args
                 .get("limit")
@@ -151,12 +166,13 @@ fn call_tool(repo_path: &PathBuf, name: &str, args: Value) -> Result<Value> {
             Ok(json!({ "hits": engine.search(query, limit)? }))
         }
         "ckg_task_context" => {
-            maybe_auto_index(repo_path, &args)?;
+            maybe_auto_index(repo_path, &args, options)?;
             let task = required_str(&args, "task")?;
             let max_tokens = args
                 .get("max_tokens")
                 .and_then(|value| value.as_u64())
-                .unwrap_or(12_000) as usize;
+                .unwrap_or(if options.compact { 1_000 } else { 12_000 })
+                as usize;
             let hops = args
                 .get("hops")
                 .and_then(|value| value.as_u64())
@@ -198,7 +214,7 @@ fn call_tool(repo_path: &PathBuf, name: &str, args: Value) -> Result<Value> {
             Ok(serde_json::to_value(engine.neighborhood(node_id, hops)?)?)
         }
         "ckg_file" => {
-            maybe_auto_index(repo_path, &args)?;
+            maybe_auto_index(repo_path, &args, options)?;
             let path = required_str(&args, "path")?;
             let offset = args
                 .get("offset")
@@ -207,19 +223,22 @@ fn call_tool(repo_path: &PathBuf, name: &str, args: Value) -> Result<Value> {
             let limit = args
                 .get("limit")
                 .and_then(|value| value.as_u64())
-                .map(|value| value as usize);
+                .map(|value| value as usize)
+                .or_else(|| options.compact.then_some(120));
             let line_numbers = args
                 .get("line_numbers")
                 .and_then(|value| value.as_bool())
                 .unwrap_or(false);
             let storage = Storage::open_for_repo(repo_path)?;
             let engine = RetrievalEngine::new(storage);
-            Ok(engine
+            let mut value = engine
                 .file_content_range_with_fallback(repo_path, path, offset, limit, line_numbers)?
-                .unwrap_or_else(|| json!({ "error": "file not found" })))
+                .unwrap_or_else(|| json!({ "error": "file not found" }));
+            add_read_pagination(&mut value, offset.unwrap_or(1), limit);
+            Ok(value)
         }
         "ckg_grep" => {
-            maybe_auto_index(repo_path, &args)?;
+            maybe_auto_index(repo_path, &args, options)?;
             let query = required_str(&args, "query")?;
             let path_glob = args.get("path_glob").and_then(|value| value.as_str());
             let case_sensitive = args
@@ -230,38 +249,38 @@ fn call_tool(repo_path: &PathBuf, name: &str, args: Value) -> Result<Value> {
                 .get("regex")
                 .and_then(|value| value.as_bool())
                 .unwrap_or(true);
-            let limit = arg_limit(&args, 100);
+            let limit = arg_limit(&args, if options.compact { 20 } else { 100 });
             let storage = Storage::open_for_repo(repo_path)?;
             let repo_id = storage.init_repo(repo_path)?;
             let engine = RetrievalEngine::new(storage);
             engine.grep(repo_id, query, path_glob, case_sensitive, regex, limit)
         }
         "ckg_glob" => {
-            maybe_auto_index(repo_path, &args)?;
+            maybe_auto_index(repo_path, &args, options)?;
             let pattern = args
                 .get("pattern")
                 .and_then(|value| value.as_str())
                 .unwrap_or("*");
-            let limit = arg_limit(&args, 200);
+            let limit = arg_limit(&args, if options.compact { 50 } else { 200 });
             let storage = Storage::open_for_repo(repo_path)?;
             let repo_id = storage.init_repo(repo_path)?;
             let engine = RetrievalEngine::new(storage);
             engine.glob(repo_id, pattern, limit)
         }
         "ckg_workspace_symbols" => {
-            maybe_auto_index(repo_path, &args)?;
+            maybe_auto_index(repo_path, &args, options)?;
             let query = args
                 .get("query")
                 .and_then(|value| value.as_str())
                 .unwrap_or("");
-            let limit = arg_limit(&args, 100);
+            let limit = arg_limit(&args, if options.compact { 20 } else { 100 });
             let storage = Storage::open_for_repo(repo_path)?;
             let repo_id = storage.init_repo(repo_path)?;
             let engine = RetrievalEngine::new(storage);
             engine.workspace_symbols(repo_id, query, limit)
         }
         "ckg_document_symbols" => {
-            maybe_auto_index(repo_path, &args)?;
+            maybe_auto_index(repo_path, &args, options)?;
             let path = required_str(&args, "path")?;
             let storage = Storage::open_for_repo(repo_path)?;
             let repo_id = storage.init_repo(repo_path)?;
@@ -269,7 +288,7 @@ fn call_tool(repo_path: &PathBuf, name: &str, args: Value) -> Result<Value> {
             engine.document_symbols(repo_id, path)
         }
         "ckg_definition" => {
-            maybe_auto_index(repo_path, &args)?;
+            maybe_auto_index(repo_path, &args, options)?;
             let query = required_str(&args, "query")?;
             let limit = arg_limit(&args, 20);
             let storage = Storage::open_for_repo(repo_path)?;
@@ -278,7 +297,7 @@ fn call_tool(repo_path: &PathBuf, name: &str, args: Value) -> Result<Value> {
             engine.definition(repo_id, query, limit)
         }
         "ckg_definition_at" => {
-            maybe_auto_index(repo_path, &args)?;
+            maybe_auto_index(repo_path, &args, options)?;
             let path = required_str(&args, "path")?;
             let line = required_i64(&args, "line")?;
             let character = args.get("character").and_then(|value| value.as_i64());
@@ -289,40 +308,40 @@ fn call_tool(repo_path: &PathBuf, name: &str, args: Value) -> Result<Value> {
             engine.definition_at(repo_id, path, line, character, limit)
         }
         "ckg_references" => {
-            maybe_auto_index(repo_path, &args)?;
+            maybe_auto_index(repo_path, &args, options)?;
             let node_id = required_i64(&args, "node_id")?;
-            let limit = arg_limit(&args, 200);
+            let limit = arg_limit(&args, if options.compact { 20 } else { 200 });
             let storage = Storage::open_for_repo(repo_path)?;
             let repo_id = storage.init_repo(repo_path)?;
             let engine = RetrievalEngine::new(storage);
             engine.references(repo_id, node_id, limit)
         }
         "ckg_references_at" => {
-            maybe_auto_index(repo_path, &args)?;
+            maybe_auto_index(repo_path, &args, options)?;
             let path = required_str(&args, "path")?;
             let line = required_i64(&args, "line")?;
             let character = args.get("character").and_then(|value| value.as_i64());
-            let limit = arg_limit(&args, 200);
+            let limit = arg_limit(&args, if options.compact { 20 } else { 200 });
             let storage = Storage::open_for_repo(repo_path)?;
             let repo_id = storage.init_repo(repo_path)?;
             let engine = RetrievalEngine::new(storage);
             engine.references_at(repo_id, path, line, character, limit)
         }
         "ckg_call_hierarchy" => {
-            maybe_auto_index(repo_path, &args)?;
+            maybe_auto_index(repo_path, &args, options)?;
             let node_id = required_i64(&args, "node_id")?;
             let direction = args
                 .get("direction")
                 .and_then(|value| value.as_str())
                 .unwrap_or("both");
-            let limit = arg_limit(&args, 200);
+            let limit = arg_limit(&args, if options.compact { 20 } else { 200 });
             let storage = Storage::open_for_repo(repo_path)?;
             let repo_id = storage.init_repo(repo_path)?;
             let engine = RetrievalEngine::new(storage);
             engine.call_hierarchy(repo_id, node_id, direction, limit)
         }
         "ckg_call_hierarchy_at" => {
-            maybe_auto_index(repo_path, &args)?;
+            maybe_auto_index(repo_path, &args, options)?;
             let path = required_str(&args, "path")?;
             let line = required_i64(&args, "line")?;
             let character = args.get("character").and_then(|value| value.as_i64());
@@ -330,32 +349,32 @@ fn call_tool(repo_path: &PathBuf, name: &str, args: Value) -> Result<Value> {
                 .get("direction")
                 .and_then(|value| value.as_str())
                 .unwrap_or("both");
-            let limit = arg_limit(&args, 200);
+            let limit = arg_limit(&args, if options.compact { 20 } else { 200 });
             let storage = Storage::open_for_repo(repo_path)?;
             let repo_id = storage.init_repo(repo_path)?;
             let engine = RetrievalEngine::new(storage);
             engine.call_hierarchy_at(repo_id, path, line, character, direction, limit)
         }
         "ckg_imports" => {
-            maybe_auto_index(repo_path, &args)?;
+            maybe_auto_index(repo_path, &args, options)?;
             let node_id = required_i64(&args, "node_id")?;
-            let limit = arg_limit(&args, 200);
+            let limit = arg_limit(&args, if options.compact { 20 } else { 200 });
             let storage = Storage::open_for_repo(repo_path)?;
             let repo_id = storage.init_repo(repo_path)?;
             let engine = RetrievalEngine::new(storage);
             engine.imports(repo_id, node_id, limit)
         }
         "ckg_dependents" => {
-            maybe_auto_index(repo_path, &args)?;
+            maybe_auto_index(repo_path, &args, options)?;
             let node_id = required_i64(&args, "node_id")?;
-            let limit = arg_limit(&args, 200);
+            let limit = arg_limit(&args, if options.compact { 20 } else { 200 });
             let storage = Storage::open_for_repo(repo_path)?;
             let repo_id = storage.init_repo(repo_path)?;
             let engine = RetrievalEngine::new(storage);
             engine.dependents(repo_id, node_id, limit)
         }
         "ckg_suggested_tests" => {
-            maybe_auto_index(repo_path, &args)?;
+            maybe_auto_index(repo_path, &args, options)?;
             let task = required_str(&args, "task")?;
             let limit = arg_limit(&args, 20);
             let storage = Storage::open_for_repo(repo_path)?;
@@ -363,66 +382,91 @@ fn call_tool(repo_path: &PathBuf, name: &str, args: Value) -> Result<Value> {
             engine.suggested_tests_detailed(repo_path, task, limit)
         }
         "ckg_ast_graph" => {
-            maybe_auto_index(repo_path, &args)?;
-            let limit = arg_limit(&args, 500);
+            maybe_auto_index(repo_path, &args, options)?;
+            let limit = arg_limit(&args, if options.compact { 20 } else { 500 });
             let storage = Storage::open_for_repo(repo_path)?;
             let repo_id = storage.init_repo(repo_path)?;
             let mut graph = storage.subgraph_by_edge_kinds(repo_id, &["DEFINES"], limit)?;
             let mut structural = storage.subgraph_by_edge_kinds(repo_id, &["CONTAINS"], limit)?;
             graph.nodes.append(&mut structural.nodes);
             graph.edges.append(&mut structural.edges);
-            Ok(serde_json::to_value(graph)?)
+            let value = serde_json::to_value(graph)?;
+            if graph_brief_mode(&args, options) {
+                Ok(brief_graph_value("ast_graph", value, limit))
+            } else {
+                Ok(value)
+            }
         }
         "ckg_dependency_graph" => {
-            maybe_auto_index(repo_path, &args)?;
-            let limit = arg_limit(&args, 500);
+            maybe_auto_index(repo_path, &args, options)?;
+            let limit = arg_limit(&args, if options.compact { 20 } else { 500 });
             let storage = Storage::open_for_repo(repo_path)?;
             let repo_id = storage.init_repo(repo_path)?;
-            Ok(serde_json::to_value(storage.subgraph_by_edge_kinds(
+            let value = serde_json::to_value(storage.subgraph_by_edge_kinds(
                 repo_id,
                 &["IMPORTS"],
                 limit,
-            )?)?)
+            )?)?;
+            if graph_brief_mode(&args, options) {
+                Ok(brief_graph_value("dependency_graph", value, limit))
+            } else {
+                Ok(value)
+            }
         }
         "ckg_call_graph" => {
-            maybe_auto_index(repo_path, &args)?;
-            let limit = arg_limit(&args, 500);
+            maybe_auto_index(repo_path, &args, options)?;
+            let limit = arg_limit(&args, if options.compact { 20 } else { 500 });
             let storage = Storage::open_for_repo(repo_path)?;
             let repo_id = storage.init_repo(repo_path)?;
-            Ok(serde_json::to_value(storage.subgraph_by_edge_kinds(
+            let value = serde_json::to_value(storage.subgraph_by_edge_kinds(
                 repo_id,
                 &["CALLS"],
                 limit,
-            )?)?)
+            )?)?;
+            if graph_brief_mode(&args, options) {
+                Ok(brief_graph_value("call_graph", value, limit))
+            } else {
+                Ok(value)
+            }
         }
         "ckg_product_flow_graph" => {
-            maybe_auto_index(repo_path, &args)?;
-            let limit = arg_limit(&args, 500);
+            maybe_auto_index(repo_path, &args, options)?;
+            let limit = arg_limit(&args, if options.compact { 20 } else { 500 });
             let storage = Storage::open_for_repo(repo_path)?;
             let repo_id = storage.init_repo(repo_path)?;
             let endpoints = storage.nodes_by_kinds(repo_id, &["Endpoint"], limit)?;
             let references =
                 storage.subgraph_by_edge_kinds(repo_id, &["REFERENCES", "CALLS"], limit)?;
-            Ok(json!({
+            let value = json!({
                 "entrypoints": endpoints,
                 "subgraph": references
-            }))
+            });
+            if graph_brief_mode(&args, options) {
+                Ok(brief_graph_value("product_flow_graph", value, limit))
+            } else {
+                Ok(value)
+            }
         }
         "ckg_test_graph" => {
-            maybe_auto_index(repo_path, &args)?;
-            let limit = arg_limit(&args, 500);
+            maybe_auto_index(repo_path, &args, options)?;
+            let limit = arg_limit(&args, if options.compact { 20 } else { 500 });
             let storage = Storage::open_for_repo(repo_path)?;
             let repo_id = storage.init_repo(repo_path)?;
             let tests = storage.nodes_by_kinds(repo_id, &["Test"], limit)?;
             let graph = storage.subgraph_by_edge_kinds(repo_id, &["TESTS"], limit)?;
-            Ok(json!({
+            let value = json!({
                 "tests": tests,
                 "subgraph": graph
-            }))
+            });
+            if graph_brief_mode(&args, options) {
+                Ok(brief_graph_value("test_graph", value, limit))
+            } else {
+                Ok(value)
+            }
         }
         "ckg_semantic_summaries" => {
-            maybe_auto_index(repo_path, &args)?;
-            let limit = arg_limit(&args, 200);
+            maybe_auto_index(repo_path, &args, options)?;
+            let limit = arg_limit(&args, if options.compact { 20 } else { 200 });
             let storage = Storage::open_for_repo(repo_path)?;
             let repo_id = storage.init_repo(repo_path)?;
             Ok(json!({
@@ -474,7 +518,7 @@ fn tools(options: McpOptions) -> Value {
         {
             "name": "status",
             "description": "Alias for ckg_status. Report whether the configured repository index is stale without updating it.",
-            "inputSchema": { "type": "object", "properties": {} }
+            "inputSchema": status_schema()
         },
         {
             "name": "search",
@@ -608,6 +652,7 @@ fn tools(options: McpOptions) -> Value {
     .unwrap_or_default();
 
     if options.compact {
+        apply_compact_tool_defaults(&mut tools);
         return Value::Array(tools);
     }
 
@@ -621,7 +666,7 @@ fn tools(options: McpOptions) -> Value {
         {
             "name": "ckg_status",
             "description": "Report whether the configured repository index is stale without updating it.",
-            "inputSchema": { "type": "object", "properties": {} }
+            "inputSchema": status_schema()
         },
         {
             "name": "ckg_search",
@@ -769,9 +814,11 @@ fn tools(options: McpOptions) -> Value {
     Value::Array(tools)
 }
 
-fn resources_list(repo_path: &PathBuf) -> Result<Value> {
+fn resources_list(repo_path: &PathBuf, options: McpOptions) -> Result<Value> {
     let storage = Storage::open_for_repo(repo_path)?;
-    Indexer::new(storage).index_repo(repo_path)?;
+    if !options.compact {
+        Indexer::new(storage).index_repo(repo_path)?;
+    }
     let storage = Storage::open_for_repo(repo_path)?;
     let repo_id = storage.init_repo(repo_path)?;
     let mut resources = vec![
@@ -803,7 +850,8 @@ fn resources_list(repo_path: &PathBuf) -> Result<Value> {
             "Indexed doc/signature summaries",
         ),
     ];
-    for file in storage.list_files(repo_id)?.into_iter().take(200) {
+    let file_limit = if options.compact { 50 } else { 200 };
+    for file in storage.list_files(repo_id)?.into_iter().take(file_limit) {
         resources.push(resource(
             &format!("ckg://files/{}", file.path),
             &format!("File {}", file.path),
@@ -811,6 +859,78 @@ fn resources_list(repo_path: &PathBuf) -> Result<Value> {
         ));
     }
     Ok(json!({ "resources": resources }))
+}
+
+fn apply_compact_tool_defaults(tools: &mut [Value]) {
+    for tool in tools {
+        let Some(name) = tool
+            .get("name")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let Some(properties) = tool
+            .get_mut("inputSchema")
+            .and_then(|schema| schema.get_mut("properties"))
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+
+        if let Some(auto_index) = properties.get_mut("auto_index") {
+            auto_index["default"] = json!(false);
+        }
+        let max_bytes = properties
+            .entry("max_bytes".to_string())
+            .or_insert_with(|| json!({ "type": "integer", "default": 12000 }));
+        max_bytes["default"] = json!(12000);
+
+        match name.as_str() {
+            "task_context" => {
+                if let Some(max_tokens) = properties.get_mut("max_tokens") {
+                    max_tokens["default"] = json!(1000);
+                }
+                if let Some(response_mode) = properties.get_mut("response_mode") {
+                    response_mode["default"] = json!("brief");
+                }
+            }
+            "read" => {
+                if let Some(limit) = properties.get_mut("limit") {
+                    limit["default"] = json!(120);
+                }
+            }
+            "grep" => {
+                if let Some(limit) = properties.get_mut("limit") {
+                    limit["default"] = json!(20);
+                }
+            }
+            "glob" => {
+                if let Some(limit) = properties.get_mut("limit") {
+                    limit["default"] = json!(50);
+                }
+            }
+            "workspace_symbols" | "references" | "references_at" | "call_hierarchy"
+            | "call_hierarchy_at" | "imports" | "dependents" | "suggested_tests" => {
+                if let Some(limit) = properties.get_mut("limit") {
+                    limit["default"] = json!(20);
+                }
+            }
+            "ast_graph" | "dependency_graph" | "call_graph" | "product_flow_graph"
+            | "test_graph" | "semantic_summaries" => {
+                if let Some(limit) = properties.get_mut("limit") {
+                    limit["default"] = json!(20);
+                }
+                let response_mode = properties
+                    .entry("response_mode".to_string())
+                    .or_insert_with(|| {
+                        json!({ "type": "string", "enum": ["brief", "normal"], "default": "brief" })
+                    });
+                response_mode["default"] = json!("brief");
+            }
+            _ => {}
+        }
+    }
 }
 
 fn resources_templates_list() -> Value {
@@ -832,49 +952,77 @@ fn resources_templates_list() -> Value {
     })
 }
 
-fn resources_read(repo_path: &PathBuf, uri: &str) -> Result<Value> {
+fn resources_read(repo_path: &PathBuf, uri: &str, options: McpOptions) -> Result<Value> {
     let storage = Storage::open_for_repo(repo_path)?;
-    Indexer::new(storage).index_repo(repo_path)?;
+    if !options.compact {
+        Indexer::new(storage).index_repo(repo_path)?;
+    }
     let storage = Storage::open_for_repo(repo_path)?;
     storage.init_repo(repo_path)?;
     let engine = RetrievalEngine::new(storage);
     let (mime_type, text) = if uri == "ckg://repo/summary" {
-        let context =
-            engine.task_context_for_repo(Some(repo_path), "repository summary", 4_000, 1, true)?;
-        ("application/json", serde_json::to_string_pretty(&context)?)
+        let max_tokens = if options.compact { 1_000 } else { 4_000 };
+        let context = engine.task_context_for_repo(
+            Some(repo_path),
+            "repository summary",
+            max_tokens,
+            1,
+            true,
+        )?;
+        let value = if options.compact {
+            brief_task_context(context, max_tokens)
+        } else {
+            serde_json::to_value(context)?
+        };
+        ("application/json", serialize_mcp_json(&value, options)?)
     } else if let Some(path) = uri.strip_prefix("ckg://files/") {
-        let value = engine
-            .file_content_range_with_fallback(repo_path, path, None, None, true)?
+        let limit = options.compact.then_some(120);
+        let mut value = engine
+            .file_content_range_with_fallback(repo_path, path, Some(1), limit, true)?
             .unwrap_or_else(|| json!({ "error": "file not found" }));
-        ("application/json", serde_json::to_string_pretty(&value)?)
+        add_read_pagination(&mut value, 1, limit);
+        ("application/json", serialize_mcp_json(&value, options)?)
     } else if let Some(id) = uri.strip_prefix("ckg://nodes/") {
         let node_id = id.parse::<i64>().unwrap_or_default();
         let graph = engine.neighborhood(node_id, 1)?;
-        ("application/json", serde_json::to_string_pretty(&graph)?)
+        let value = serde_json::to_value(graph)?;
+        let value = if options.compact {
+            brief_graph_value("node_neighborhood", value, 20)
+        } else {
+            value
+        };
+        ("application/json", serialize_mcp_json(&value, options)?)
     } else if uri == "ckg://graphs/ast" {
-        graph_resource(repo_path, &["DEFINES", "CONTAINS"], 1_000)?
+        graph_resource(repo_path, "ast_graph", &["DEFINES", "CONTAINS"], options)?
     } else if uri == "ckg://graphs/dependency" {
-        graph_resource(repo_path, &["IMPORTS"], 1_000)?
+        graph_resource(repo_path, "dependency_graph", &["IMPORTS"], options)?
     } else if uri == "ckg://graphs/call" {
-        graph_resource(repo_path, &["CALLS"], 1_000)?
+        graph_resource(repo_path, "call_graph", &["CALLS"], options)?
     } else if uri == "ckg://graphs/product-flow" {
         let storage = Storage::open_for_repo(repo_path)?;
         let repo_id = storage.init_repo(repo_path)?;
-        let endpoints = storage.nodes_by_kinds(repo_id, &["Endpoint"], 1_000)?;
-        let subgraph = storage.subgraph_by_edge_kinds(repo_id, &["REFERENCES", "CALLS"], 1_000)?;
+        let limit = if options.compact { 20 } else { 1_000 };
+        let endpoints = storage.nodes_by_kinds(repo_id, &["Endpoint"], limit)?;
+        let subgraph = storage.subgraph_by_edge_kinds(repo_id, &["REFERENCES", "CALLS"], limit)?;
         let value = json!({ "entrypoints": endpoints, "subgraph": subgraph });
-        ("application/json", serde_json::to_string_pretty(&value)?)
+        let value = if options.compact {
+            brief_graph_value("product_flow_graph", value, limit)
+        } else {
+            value
+        };
+        ("application/json", serialize_mcp_json(&value, options)?)
     } else if uri == "ckg://graphs/test" {
-        graph_resource(repo_path, &["TESTS"], 1_000)?
+        graph_resource(repo_path, "test_graph", &["TESTS"], options)?
     } else if uri == "ckg://summaries/semantic" {
         let storage = Storage::open_for_repo(repo_path)?;
         let repo_id = storage.init_repo(repo_path)?;
-        let value = json!({ "summaries": storage.semantic_summary_nodes(repo_id, 1_000)? });
-        ("application/json", serde_json::to_string_pretty(&value)?)
+        let limit = if options.compact { 20 } else { 1_000 };
+        let value = json!({ "summaries": storage.semantic_summary_nodes(repo_id, limit)? });
+        ("application/json", serialize_mcp_json(&value, options)?)
     } else {
         (
             "application/json",
-            serde_json::to_string_pretty(&json!({ "error": "unknown resource" }))?,
+            serialize_mcp_json(&json!({ "error": "unknown resource" }), options)?,
         )
     };
     Ok(json!({
@@ -888,13 +1036,29 @@ fn resources_read(repo_path: &PathBuf, uri: &str) -> Result<Value> {
 
 fn graph_resource(
     repo_path: &PathBuf,
+    name: &str,
     kinds: &[&str],
-    limit: usize,
+    options: McpOptions,
 ) -> Result<(&'static str, String)> {
     let storage = Storage::open_for_repo(repo_path)?;
     let repo_id = storage.init_repo(repo_path)?;
+    let limit = if options.compact { 20 } else { 1_000 };
     let graph = storage.subgraph_by_edge_kinds(repo_id, kinds, limit)?;
-    Ok(("application/json", serde_json::to_string_pretty(&graph)?))
+    let value = serde_json::to_value(graph)?;
+    let value = if options.compact {
+        brief_graph_value(name, value, limit)
+    } else {
+        value
+    };
+    Ok(("application/json", serialize_mcp_json(&value, options)?))
+}
+
+fn serialize_mcp_json(value: &Value, options: McpOptions) -> Result<String> {
+    if options.compact {
+        Ok(serde_json::to_string(value)?)
+    } else {
+        Ok(serde_json::to_string_pretty(value)?)
+    }
 }
 
 fn resource(uri: &str, name: &str, description: &str) -> Value {
@@ -911,7 +1075,19 @@ fn limit_schema() -> Value {
         "type": "object",
         "properties": {
             "limit": { "type": "integer", "default": 500 },
-            "auto_index": { "type": "boolean", "default": true }
+            "response_mode": { "type": "string", "enum": ["brief", "normal"], "default": "normal" },
+            "auto_index": { "type": "boolean", "default": true },
+            "max_bytes": { "type": "integer" }
+        }
+    })
+}
+
+fn status_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "include_files": { "type": "boolean", "default": false },
+            "max_bytes": { "type": "integer" }
         }
     })
 }
@@ -922,7 +1098,8 @@ fn search_schema() -> Value {
         "properties": {
             "query": { "type": "string" },
             "limit": { "type": "integer", "default": 20 },
-            "auto_index": { "type": "boolean", "default": true }
+            "auto_index": { "type": "boolean", "default": true },
+            "max_bytes": { "type": "integer" }
         },
         "required": ["query"]
     })
@@ -937,7 +1114,8 @@ fn task_context_schema() -> Value {
             "hops": { "type": "integer", "default": 2 },
             "include_git_dirty": { "type": "boolean", "default": true },
             "response_mode": { "type": "string", "enum": ["brief", "normal"], "default": "brief" },
-            "auto_index": { "type": "boolean", "default": true }
+            "auto_index": { "type": "boolean", "default": true },
+            "max_bytes": { "type": "integer" }
         },
         "required": ["task"]
     })
@@ -951,7 +1129,8 @@ fn read_schema() -> Value {
             "offset": { "type": "integer", "description": "1-based start line" },
             "limit": { "type": "integer", "description": "Maximum lines to return" },
             "line_numbers": { "type": "boolean", "default": false },
-            "auto_index": { "type": "boolean", "default": true }
+            "auto_index": { "type": "boolean", "default": true },
+            "max_bytes": { "type": "integer" }
         },
         "required": ["path"]
     })
@@ -966,7 +1145,8 @@ fn grep_schema() -> Value {
             "case_sensitive": { "type": "boolean", "default": false },
             "regex": { "type": "boolean", "default": true },
             "limit": { "type": "integer", "default": 100 },
-            "auto_index": { "type": "boolean", "default": true }
+            "auto_index": { "type": "boolean", "default": true },
+            "max_bytes": { "type": "integer" }
         },
         "required": ["query"]
     })
@@ -978,7 +1158,8 @@ fn glob_schema() -> Value {
         "properties": {
             "pattern": { "type": "string", "default": "*" },
             "limit": { "type": "integer", "default": 200 },
-            "auto_index": { "type": "boolean", "default": true }
+            "auto_index": { "type": "boolean", "default": true },
+            "max_bytes": { "type": "integer" }
         }
     })
 }
@@ -989,7 +1170,8 @@ fn symbol_query_schema() -> Value {
         "properties": {
             "query": { "type": "string" },
             "limit": { "type": "integer", "default": 100 },
-            "auto_index": { "type": "boolean", "default": true }
+            "auto_index": { "type": "boolean", "default": true },
+            "max_bytes": { "type": "integer" }
         },
         "required": ["query"]
     })
@@ -1001,7 +1183,8 @@ fn node_limit_schema() -> Value {
         "properties": {
             "node_id": { "type": "integer" },
             "limit": { "type": "integer", "default": 200 },
-            "auto_index": { "type": "boolean", "default": true }
+            "auto_index": { "type": "boolean", "default": true },
+            "max_bytes": { "type": "integer" }
         },
         "required": ["node_id"]
     })
@@ -1013,7 +1196,8 @@ fn suggested_tests_schema() -> Value {
         "properties": {
             "task": { "type": "string" },
             "limit": { "type": "integer", "default": 20 },
-            "auto_index": { "type": "boolean", "default": true }
+            "auto_index": { "type": "boolean", "default": true },
+            "max_bytes": { "type": "integer" }
         },
         "required": ["task"]
     })
@@ -1027,7 +1211,8 @@ fn position_schema(include_direction: bool) -> Value {
             "line": { "type": "integer", "description": "1-based line number" },
             "character": { "type": "integer", "description": "1-based character offset" },
             "limit": { "type": "integer", "default": 200 },
-            "auto_index": { "type": "boolean", "default": true }
+            "auto_index": { "type": "boolean", "default": true },
+            "max_bytes": { "type": "integer" }
         },
         "required": ["path", "line"]
     });
@@ -1037,11 +1222,11 @@ fn position_schema(include_direction: bool) -> Value {
     value
 }
 
-fn maybe_auto_index(repo_path: &PathBuf, args: &Value) -> Result<()> {
+fn maybe_auto_index(repo_path: &PathBuf, args: &Value, options: McpOptions) -> Result<()> {
     let enabled = args
         .get("auto_index")
         .and_then(|value| value.as_bool())
-        .unwrap_or(true);
+        .unwrap_or(!options.compact);
     if enabled {
         let storage = Storage::open_for_repo(repo_path)?;
         Indexer::new(storage).index_repo(repo_path)?;
@@ -1049,9 +1234,260 @@ fn maybe_auto_index(repo_path: &PathBuf, args: &Value) -> Result<()> {
     Ok(())
 }
 
+fn arg_bool(args: &Value, key: &str, default: bool) -> bool {
+    args.get(key)
+        .and_then(|value| value.as_bool())
+        .unwrap_or(default)
+}
+
+fn graph_brief_mode(args: &Value, options: McpOptions) -> bool {
+    args.get("response_mode")
+        .and_then(|value| value.as_str())
+        .unwrap_or(if options.compact { "brief" } else { "normal" })
+        == "brief"
+}
+
+fn brief_status(value: Value, sample_limit: usize) -> Value {
+    let sample = |key: &str| {
+        value
+            .get(key)
+            .and_then(|value| value.as_array())
+            .map(|items| items.iter().take(sample_limit).cloned().collect::<Vec<_>>())
+            .unwrap_or_default()
+    };
+    let count = |key: &str| {
+        value
+            .get(key)
+            .and_then(|value| value.as_array())
+            .map(|items| items.len())
+            .unwrap_or(0)
+    };
+    json!({
+        "repo_id": value.get("repo_id").cloned().unwrap_or(Value::Null),
+        "db_path": value.get("db_path").cloned().unwrap_or(Value::Null),
+        "indexed_files": value.get("indexed_files").cloned().unwrap_or(Value::Null),
+        "scan_mode": value.get("scan_mode").cloned().unwrap_or(Value::Null),
+        "scanned": value.get("scanned").cloned().unwrap_or(Value::Null),
+        "needs_index": value.get("needs_index").cloned().unwrap_or(Value::Bool(false)),
+        "changed_count": count("changed_files"),
+        "new_count": count("new_files"),
+        "modified_count": count("modified_files"),
+        "deleted_count": count("deleted_files"),
+        "changed_files_sample": sample("changed_files"),
+        "new_files_sample": sample("new_files"),
+        "modified_files_sample": sample("modified_files"),
+        "deleted_files_sample": sample("deleted_files"),
+        "truncated": count("changed_files") > sample_limit
+            || count("new_files") > sample_limit
+            || count("modified_files") > sample_limit
+            || count("deleted_files") > sample_limit
+    })
+}
+
+fn add_read_pagination(value: &mut Value, offset: usize, limit: Option<usize>) {
+    let Some(limit) = limit else {
+        return;
+    };
+    let total = value
+        .get("total_lines")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0) as usize;
+    let end = value
+        .get("end_line")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0) as usize;
+    let truncated = total > 0 && end < total;
+    value["limit"] = json!(limit);
+    value["truncated"] = json!(truncated);
+    value["next_offset"] = if truncated {
+        json!(offset.saturating_add(limit))
+    } else {
+        Value::Null
+    };
+}
+
+fn brief_graph_value(name: &str, value: Value, limit: usize) -> Value {
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    collect_graph_parts(&value, &mut nodes, &mut edges);
+    let mut node_names = HashMap::new();
+    for node in &nodes {
+        if let Some(id) = node.get("id").and_then(|value| value.as_i64()) {
+            let label = node
+                .get("name")
+                .and_then(|value| value.as_str())
+                .unwrap_or("node");
+            let path = node
+                .get("path")
+                .and_then(|value| value.as_str())
+                .map(str::to_string);
+            node_names.insert(id, compact_label(label, &path));
+        }
+    }
+    let sample_edges = edges
+        .iter()
+        .take(limit.min(20))
+        .map(|edge| {
+            let source_id = edge
+                .get("source_id")
+                .and_then(|value| value.as_i64())
+                .unwrap_or_default();
+            let target_id = edge
+                .get("target_id")
+                .and_then(|value| value.as_i64())
+                .unwrap_or_default();
+            let kind = edge
+                .get("kind")
+                .and_then(|value| value.as_str())
+                .unwrap_or("EDGE");
+            let source = node_names
+                .get(&source_id)
+                .cloned()
+                .unwrap_or_else(|| source_id.to_string());
+            let target = node_names
+                .get(&target_id)
+                .cloned()
+                .unwrap_or_else(|| target_id.to_string());
+            format!("{source} -{kind}-> {target}")
+        })
+        .collect::<Vec<_>>();
+
+    let mut top_files = Vec::new();
+    for node in &nodes {
+        if let Some(path) = node.get("path").and_then(|value| value.as_str()) {
+            if !path.is_empty() && !top_files.iter().any(|seen| seen == path) {
+                top_files.push(path.to_string());
+            }
+        }
+        if top_files.len() >= 10 {
+            break;
+        }
+    }
+
+    json!({
+        "graph": name,
+        "nodes": nodes.len(),
+        "edges": edges.len(),
+        "sample_edges": sample_edges,
+        "top_files": top_files,
+        "limit": limit,
+        "truncated": edges.len() >= limit || nodes.len() >= limit
+    })
+}
+
+fn collect_graph_parts<'a>(
+    value: &'a Value,
+    nodes: &mut Vec<&'a Value>,
+    edges: &mut Vec<&'a Value>,
+) {
+    if let Some(items) = value.get("nodes").and_then(|value| value.as_array()) {
+        nodes.extend(items);
+    }
+    if let Some(items) = value.get("edges").and_then(|value| value.as_array()) {
+        edges.extend(items);
+    }
+    if let Some(subgraph) = value.get("subgraph") {
+        collect_graph_parts(subgraph, nodes, edges);
+    }
+    if let Some(items) = value.get("entrypoints").and_then(|value| value.as_array()) {
+        nodes.extend(items);
+    }
+    if let Some(items) = value.get("tests").and_then(|value| value.as_array()) {
+        nodes.extend(items);
+    }
+}
+
+fn budget_tool_value(mut value: Value, args: &Value, options: McpOptions) -> Result<Value> {
+    let requested_max_bytes = args.get("max_bytes").and_then(|value| value.as_u64());
+    if !options.compact && requested_max_bytes.is_none() {
+        return Ok(value);
+    }
+    let max_bytes = requested_max_bytes.unwrap_or(12_000) as usize;
+    for _ in 0..8 {
+        let size = serde_json::to_vec(&value)?.len();
+        if size <= max_bytes {
+            return Ok(value);
+        }
+        if shrink_value(&mut value) {
+            continue;
+        }
+        return Ok(json!({
+            "truncated": true,
+            "max_bytes": max_bytes,
+            "message": "MCP compact response exceeded budget; retry with smaller limit/offset or response_mode=brief."
+        }));
+    }
+    if serde_json::to_vec(&value)?.len() <= max_bytes {
+        Ok(value)
+    } else {
+        Ok(json!({
+            "truncated": true,
+            "max_bytes": max_bytes,
+            "message": "MCP compact response exceeded budget; retry with smaller limit/offset or response_mode=brief."
+        }))
+    }
+}
+
+fn shrink_value(value: &mut Value) -> bool {
+    match value {
+        Value::Array(items) => {
+            if items.len() > 4 {
+                items.truncate(items.len().div_ceil(2));
+                return true;
+            }
+            for item in items {
+                if shrink_value(item) {
+                    return true;
+                }
+            }
+            false
+        }
+        Value::Object(map) => {
+            for key in [
+                "content",
+                "matches",
+                "files",
+                "hits",
+                "symbols",
+                "summaries",
+                "sample_edges",
+            ] {
+                if let Some(value) = map.get_mut(key) {
+                    if shrink_value(value) {
+                        map.insert("truncated".to_string(), Value::Bool(true));
+                        return true;
+                    }
+                }
+            }
+            for value in map.values_mut() {
+                if shrink_value(value) {
+                    map.insert("truncated".to_string(), Value::Bool(true));
+                    return true;
+                }
+            }
+            false
+        }
+        Value::String(text) => {
+            if text.len() > 1200 {
+                truncate_chars(text, text.len() / 2);
+                return true;
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
 fn brief_task_context(mut context: TaskContextResponse, max_tokens: usize) -> Value {
     let context_limit = max_tokens.saturating_mul(2).clamp(600, 2_400);
     truncate_chars(&mut context.context_pack, context_limit);
+
+    let nodes_by_id = context
+        .subgraph
+        .nodes
+        .iter()
+        .map(|node| (node.id, node))
+        .collect::<HashMap<_, _>>();
 
     let files = context
         .relevant_files
@@ -1065,13 +1501,61 @@ fn brief_task_context(mut context: TaskContextResponse, max_tokens: usize) -> Va
         .iter()
         .filter_map(|hit| {
             let name = hit.name.as_deref()?;
+            let node = hit.node_id.and_then(|id| nodes_by_id.get(&id).copied());
+            let path = hit
+                .path
+                .clone()
+                .or_else(|| node.and_then(|node| node.path.clone()));
             Some(json!({
                 "name": name,
-                "path": hit.path.clone(),
+                "path": path,
+                "node_id": hit.node_id,
+                "line": node.and_then(|node| node.start_line),
+                "end_line": node.and_then(|node| node.end_line),
             }))
         })
         .take(4)
         .collect::<Vec<_>>();
+
+    let mut read_hints = Vec::new();
+    let mut seen_hints = HashSet::new();
+    for symbol in &symbols {
+        let Some(path) = symbol.get("path").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let line = symbol
+            .get("line")
+            .and_then(|value| value.as_i64())
+            .unwrap_or(1)
+            .max(1) as usize;
+        let offset = line.saturating_sub(20).max(1);
+        let key = format!("{path}:{offset}");
+        if seen_hints.insert(key) {
+            read_hints.push(json!({
+                "path": path,
+                "offset": offset,
+                "limit": 80
+            }));
+        }
+        if read_hints.len() >= 4 {
+            break;
+        }
+    }
+    if read_hints.len() < 4 {
+        for path in &files {
+            let key = format!("{path}:1");
+            if seen_hints.insert(key) {
+                read_hints.push(json!({
+                    "path": path,
+                    "offset": 1,
+                    "limit": 120
+                }));
+            }
+            if read_hints.len() >= 4 {
+                break;
+            }
+        }
+    }
 
     let tests = context
         .suggested_tests
@@ -1109,6 +1593,7 @@ fn brief_task_context(mut context: TaskContextResponse, max_tokens: usize) -> Va
         "context": context.context_pack,
         "files": files,
         "symbols": symbols,
+        "read_hints": read_hints,
         "tests": tests,
         "graph": {
             "nodes": context.subgraph.nodes.len(),
@@ -1161,4 +1646,106 @@ fn write_response(stdout: &mut io::Stdout, response: Value) -> Result<()> {
     writeln!(stdout, "{}", serde_json::to_string(&response)?)?;
     stdout.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+
+    fn setup_repo() -> Result<tempfile::TempDir> {
+        let dir = tempfile::tempdir()?;
+        fs::create_dir_all(dir.path().join("src"))?;
+        let mut large = String::new();
+        for idx in 0..400 {
+            large.push_str(&format!(
+                "export function helper{idx}() {{ return 'MCP integration {idx}'; }}\n"
+            ));
+        }
+        fs::write(dir.path().join("src/large.ts"), large)?;
+        fs::write(
+            dir.path().join("src/a.ts"),
+            "import { helper1 } from './large';\nexport function run() { return helper1(); }\n",
+        )?;
+        let storage = Storage::open_for_repo(dir.path())?;
+        Indexer::new(storage).index_repo(dir.path())?;
+        Ok(dir)
+    }
+
+    fn call(repo_path: &PathBuf, request: Value) -> Result<Value> {
+        handle_request(repo_path, &request, McpOptions { compact: true })?
+            .ok_or_else(|| anyhow::anyhow!("missing MCP response"))
+    }
+
+    #[test]
+    fn compact_resource_file_is_paginated_and_budgeted() -> Result<()> {
+        let dir = setup_repo()?;
+        let response = call(
+            &dir.path().to_path_buf(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "resources/read",
+                "params": { "uri": "ckg://files/src/large.ts" }
+            }),
+        )?;
+        let size = serde_json::to_vec(&response)?.len();
+        assert!(size < 12_000, "resource response too large: {size}");
+        let text = response["contents"][0]["text"].as_str().unwrap_or_default();
+        let body: Value = serde_json::from_str(text)?;
+        assert_eq!(body["truncated"].as_bool(), Some(true));
+        assert_eq!(body["next_offset"].as_u64(), Some(121));
+        Ok(())
+    }
+
+    #[test]
+    fn compact_resource_graph_is_brief_and_budgeted() -> Result<()> {
+        let dir = setup_repo()?;
+        let response = call(
+            &dir.path().to_path_buf(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "resources/read",
+                "params": { "uri": "ckg://graphs/dependency" }
+            }),
+        )?;
+        let size = serde_json::to_vec(&response)?.len();
+        assert!(size < 12_000, "graph resource response too large: {size}");
+        let text = response["contents"][0]["text"].as_str().unwrap_or_default();
+        let body: Value = serde_json::from_str(text)?;
+        assert_eq!(body["graph"].as_str(), Some("dependency_graph"));
+        assert!(body.get("sample_edges").is_some());
+        assert!(body.get("edges").and_then(Value::as_array).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn compact_task_context_tool_is_budgeted() -> Result<()> {
+        let dir = setup_repo()?;
+        let response = call(
+            &dir.path().to_path_buf(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "task_context",
+                    "arguments": {
+                        "task": "MCP integration",
+                        "max_tokens": 800,
+                        "auto_index": false
+                    }
+                }
+            }),
+        )?;
+        let size = serde_json::to_vec(&response)?.len();
+        assert!(size < 10_000, "task_context response too large: {size}");
+        let text = response["content"][0]["text"].as_str().unwrap_or_default();
+        let body: Value = serde_json::from_str(text)?;
+        assert!(body.get("read_hints").is_some());
+        assert!(body.get("subgraph").is_none());
+        Ok(())
+    }
 }

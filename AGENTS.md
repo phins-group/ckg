@@ -61,7 +61,8 @@ Retrieval:
 
 ```text
 search/task-context/MCP tool
-  -> auto-index by default unless auto_index=false
+  -> in compact mode, read stale index by default unless auto_index=true
+  -> in normal mode, auto-index by default unless auto_index=false
   -> query SQLite FTS5 or LIKE fallback
   -> include git dirty files as strong task-context signals when repo has Git
   -> hydrate files/symbols
@@ -274,15 +275,18 @@ Avoid advertising legacy `ckg_search` to prefixing clients unless `ckg_ckg_searc
 is acceptable. Use `--compact` for agent-facing configs so only alias tools are
 advertised.
 
-Retrieval tools auto-index by default. Pass `auto_index: false` only when the
-caller intentionally wants stale index reads for speed. `read` falls back to a
-safe repo-local filesystem read if a newly created file has not been indexed yet.
-Use `status`/`ckg_status` when the caller needs to know whether the index is
-stale without updating it.
+In normal MCP mode retrieval tools auto-index by default. In `--compact`
+agent-facing mode, retrieval tools default to `auto_index: false`; call
+`status` first, then call `index` only when needed or pass `auto_index: true`
+explicitly. `read` falls back to a safe repo-local filesystem read if a newly
+created file has not been indexed yet.
 `task_context.max_tokens` budgets the entire response, including compact graph
 signals. MCP `task_context` defaults to `response_mode: "brief"` and returns
-`query`, `context`, `files`, `symbols`, `tests`, and compact graph counts/sample
-edges. Full raw graphs should be requested through the dedicated graph tools.
+`query`, `context`, `files`, `symbols`, `read_hints`, `tests`, and compact graph
+counts/sample edges. Compact mode also defaults `read` to 120 lines, `grep` to
+20 matches, graph tools to brief summaries with limit 20, and MCP responses to
+about 12 KB unless `max_bytes` is provided. Full raw graphs should be requested
+through the dedicated graph tools with `response_mode: "normal"`.
 
 MCP resources:
 
